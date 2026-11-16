@@ -15,6 +15,9 @@ What one backup run does for each database:
 6. Applies the retention policy and removes all local temporary files.
 
 If one database fails, the others still run. The exit code is `1` if any database failed.
+
+> **Working on the code?** See [Internals](#internals-for-developers-and-ai-agents). It covers the
+> architecture, data flow, storage format, invariants and how to extend the tool.
 If only the retention cleanup fails, the backup is still reported `OK` with a warning, because it is already safely on Drive.
 
 ## Requirements
@@ -147,18 +150,199 @@ system cron, for example:
 Logs are JSON lines on stderr. The level is set by `LOG_LEVEL`: `debug|info|warn|error`. Passwords, tokens and keys
 are redacted.
 
-## Encrypted file format
+## Internals (for developers and AI agents)
 
-`BMENC2` (6 bytes) | nonce prefix (7 bytes) | segments… The data is compressed first, then encrypted.
-Each segment holds 1 MiB of plaintext, AES-256-GCM encrypted, followed by a 16-byte auth tag. The last segment can be shorter.
-Segment *i* uses the IV `prefix | uint32be(i) | lastFlag`, and the header is authenticated as AAD.
-Changing, reordering, dropping or cutting off any segment makes decryption fail. Because the file is
-split into segments, it avoids the single-message GCM limit of about 64 GiB.
+This section explains how the code works, so that someone, human or AI, can change it safely without
+reading every file first. Everything above it describes how to *use* the tool.
+
+### At a glance
+
+- **Language and runtime:** Node.js ≥ 18.17, ES modules (`"type": "module"`). There is no build step and no TypeScript.
+- **Entry point:** `bin/backup-manager.js` → `src/cli.js` `main(argv)`. `main` returns an exit code and does not call `process.exit`.
+- **Runtime dependencies:**
+  - `mssql`, the SQL Server driver (tedious).
+  - `google-auth-library`, for OAuth and authorized HTTP requests.
+  - `node-cron`, for scheduling.
+  - The Drive API is called over **raw REST**. The project does not use `googleapis`.
+- **Tests:** `npm test` runs `node --test test/`. Nothing in the tests touches a real SQL Server, Google or the network,
+  except a loopback HTTP server on 127.0.0.1.
+- **Design rule:** I/O is **injected**. The orchestration in `src/backup.js` receives `drive`, `createSqlClient`,
+  `logger` and `now` as parameters, which is what makes it unit-testable.
+
+### File map
+
+| File | Responsibility | Key exports |
+| --- | --- | --- |
+| `bin/backup-manager.js` | Shebang wrapper: runs `main`, sets `process.exitCode`, prints `Error: …` for uncaught errors | — |
+| `src/cli.js` | Argument parsing (`node:util` `parseArgs`), command dispatch, human/JSON output | `main`, `USAGE` |
+| `src/config.js` | Loads JSON config, resolves `env:VAR`, validates, applies defaults, parses the encryption key | `loadConfig`, `normalizeConfig`, `ConfigError`, `parseEncryptionKey` |
+| `src/auth.js` | OAuth installed-app flow (loopback + PKCE + state), token file I/O, status, logout/revoke | `login`, `status`, `logout`, `getAuthorizedClient`, `startLoopbackServer` |
+| `src/mssql.js` | SQL text builders + `MssqlClient` wrapper (connect, online check, BACKUP, VERIFYONLY) | `MssqlClient`, `buildBackupSql`, `buildVerifySql`, `toPoolConfig` |
+| `src/drive.js` | Minimal Drive v3 client: folders, list, chunked resumable upload, download, delete, retry policy | `DriveStore`, `isRetryable`, `escapeQuery`, `APP_TAG` |
+| `src/transform.js` | Streaming gzip, segmented AES-256-GCM encrypt/decrypt, hashing (SHA-256 + MD5) | `packFile`, `unpackFile`, `hashFile`, `createEncryptStream`, `createDecryptStream` |
+| `src/backup.js` | Orchestration: backup → verify → pack → upload → check → retention; list; download | `runBackups`, `backupOne`, `applyRetention`, `listBackups`, `downloadBackup`, `selectTargets` |
+| `src/retention.js` | Pure function that decides which backups to delete | `selectForDeletion` |
+| `src/naming.js` | File names, timestamps, server-side path joining (Windows or Linux), artifact suffixes | `backupBaseName`, `joinServerPath`, `artifactName`, `parseArtifactName` |
+| `src/scheduler.js` | Cron wrapper with an in-process overlap guard | `startScheduler`, `nonOverlapping` |
+| `src/logger.js` | JSON-lines logger to stderr with secret redaction | `createLogger`, `redact`, `silentLogger` |
+
+### Data flow of `backup` (one database)
+
+`backupOne()` in `src/backup.js`:
+
+```
+selectTargets(config, {server, db})            # which (server, db) pairs; error if none match
+  └─ per server: createSqlClient(server).connect()   # connect failure ⇒ all its DBs FAIL, others continue
+       └─ per db: backupOne()
+            1. sqlClient.assertDatabaseOnline(db)        SELECT state_desc FROM sys.databases WHERE name=@db
+            2. sqlClient.backup(db, serverPath)          BACKUP DATABASE @db TO DISK=@path WITH CHECKSUM, COPY_ONLY, INIT, FORMAT, STATS=10 [, COMPRESSION]
+            3. sqlClient.verify(serverPath)              RESTORE VERIFYONLY FROM DISK=@path WITH CHECKSUM
+            4. fs.access(localBak)                       same file as seen by this process (localBackupDir)
+            5. packFile(localBak → workDir/artifact)     gzip? → encrypt? → hash (sha256+md5); skipped if neither
+            6. drive.ensurePath([rootFolder, server.name, db])
+            7. drive.uploadResumable(...)                appProperties: bmApp, sha256, compressed, encrypted
+            8. compare Drive md5Checksum/size with local ⇒ mismatch: delete upload, throw
+            9. applyRetention(...)                       failure ⇒ warning + result.retentionError, still ok:true
+          finally: delete packed artifact and local .bak (always, success or failure)
+```
+
+`runBackups()` returns `{ results: [{server, db, ok, fileId?, name?, bytes?, deleted?, retentionError?, error?, durationMs?}], failed }`.
+The CLI exits with `1` when `failed > 0`.
+
+### Storage layout and metadata on Google Drive
+
+```
+My Drive/
+└── <drive.rootFolder>/                 default "MSSQL Backups"
+    └── <server.name>/                  e.g. "prod"
+        └── <database name, verbatim>/  e.g. "Sales"
+            └── <sanitizedDb>_<YYYYMMDDTHHMMSSZ>.bak[.gz][.enc]
+```
+
+- **Artifact name.** Built by `naming.js`. The suffix order is fixed: `.bak`, then `.gz`, then `.enc`. `parseArtifactName` reverses it.
+  The DB part is passed through `sanitizeForFile` (`[^A-Za-z0-9._-]` → `_`).
+- **`appProperties` on every backup file.** These are private to the OAuth client.
+  - `bmApp=backup-manager` (`APP_TAG`). **Only files carrying this tag are treated as backups**, so `list`, retention and `download` ignore everything else.
+  - `sha256`: SHA-256 of the **uploaded bytes**, i.e. the artifact *after* compression and encryption.
+  - `compressed` and `encrypted`: `"1"` or `"0"`. `download` reads these, not the file name, to decide how to unpack.
+- **Discovery.** `listBackups()` walks the folders (root → server → db) instead of querying metadata, because
+  `appProperties` values are limited to 124 bytes and DB names can be up to 128 characters.
+- **Scope.** `drive.file` means the tool only sees files and folders it created. A folder created by hand in the Drive UI
+  with the same name is **invisible** to it, and the tool will create its own.
+
+### Local files
+
+| Path | Written by | Lifetime |
+| --- | --- | --- |
+| `servers[].backupDir/<base>.bak` (SQL Server's view) = `localBackupDir/<base>.bak` (our view) | SQL Server | Deleted in `backupOne`'s `finally` |
+| `workDir/<artifact>` | `packFile` (mode 0600) | Deleted in `backupOne`'s `finally` |
+| `google.tokenFile` | `auth.writeToken` (atomic write via tmp + rename, mode 0600, dir 0700) | Until `auth logout` |
+| `<outDir>/<base>.bak.download` and `.partial` | `downloadBackup` | Temporary. Renamed to `<base>.bak` on success, removed on failure |
+
+Token file contents: `{ "refresh_token", "scope", "email", "createdAt" }`. No access token is stored.
+
+### Encrypted file format
+
+```
+"BMENC2" (6 B) | nonce prefix (7 B) | seg_0 | seg_1 | … | seg_last
+seg_i      = AES-256-GCM(plaintext_i) || tag (16 B)
+plaintext_i = exactly SEGMENT_SIZE (1 MiB) bytes, except seg_last: 0..SEGMENT_SIZE bytes
+IV_i       = prefix (7 B) | uint32be(i) (4 B) | lastFlag (1 B: 1 for seg_last, else 0)
+AAD        = the 13-byte header
+```
+
+- **Encryptor.** Emits a segment that isn't the last only when it knows more data follows (`pending > segmentSize`).
+- **Decryptor.** Opens a segment that isn't the last only when `pending > segmentSize + 16`. It always holds the last sealed segment back until `flush`, where it opens it with `lastFlag=1`.
+- **Keep the two rules matched.** They are what make truncation at a segment boundary detectable. If you change one, change the other and run `test/review-fixes.test.js`.
+- **Order of operations.** Compression happens **before** encryption.
+- **Key.** 32 raw bytes, from the env var named by `encryption.keyEnv`, given as base64 or 64 hex characters.
+
+### Invariants: do not break these
+
+1. **No SQL string concatenation.** The DB name and path go in as `@db` and `@path` parameters (`NVarChar`) through
+   `request().input(...).query(...)`. T-SQL accepts variables in `BACKUP DATABASE` and `TO DISK`. `test/mssql.test.js` asserts this.
+2. **`COPY_ONLY` stays.** Without it, this tool would break the user's existing differential and log backup chain.
+3. **One failing database must not stop the others.** Every per-DB error is caught in `runBackups`.
+4. **Local cleanup always runs**, in the `finally` of `backupOne`. That way disks don't fill up after repeated failures.
+5. **Never delete the newest backup.** Retention keeps a file if *any* rule keeps it (`keepLast` or `keepDays`).
+6. **Never log secrets.** Use the logger. It redacts keys that match `/pass|secret|token|authorization|api.?key|encryption.?key/`
+   and scrubs `Bearer …` and `refresh_token=…` from messages. Don't `console.log` config objects.
+7. **Booleans in config are strict.** Only `true`, `false`, `"true"` or `"false"` are accepted, through `bool()` in `config.js`.
+   This prevents `"enabled": "yes"` from silently disabling encryption.
+8. **OAuth scope stays `drive.file`.** Wider scopes need Google app verification and expose the user's whole Drive.
+9. **`download` refuses unsafe names and doesn't overwrite** without `force`. File names come from Drive and are untrusted.
+
+### Retry policy (`src/drive.js`)
+
+- **Retried, with exponential backoff and jitter, up to `maxRetries` (default 5):**
+  - HTTP 429 and 5xx.
+  - HTTP 403 when the reason is `rateLimitExceeded` or `userRateLimitExceeded`.
+  - Network errors with codes such as `ECONNRESET`, `ETIMEDOUT` or `EAI_AGAIN`.
+- **Not retried:** other 4xx responses and errors with no status or network code, such as programming bugs.
+- **Resumable upload:**
+  1. `POST …/upload/drive/v3/files?uploadType=resumable` returns a `Location` session URL.
+  2. The file is sent with `PUT` in chunks of `chunkSize`, which must be a multiple of 256 KiB (default 8 MiB).
+  3. A `308` response's `Range` header gives the next offset.
+  4. After an error, the client sends `PUT` with `Content-Range: bytes */size`, reads the server's offset and resumes from there.
+  5. A 404 or 410 means the session expired, which is fatal.
+  6. More than `maxRetries` 308 responses that make no progress abort the upload.
+
+### Errors and exit codes
+
+- **Exit codes:** `0` on success. `1` on a runtime error, when any database failed, or for `auth status` when not logged in. `2` on a usage error.
+- **Error types:** `ConfigError` (config problems) and `AuthError` (not logged in, OAuth failure). Other errors carry plain messages.
+  Messages are written to be acted on, for example "check that servers[].localBackupDir points to the same directory as backupDir".
+- **Logs:** JSON lines on **stderr**. Command output (results, lists) goes to **stdout**, so `--json` output can be piped.
+
+### Testing approach
+
+| Test file | Covers |
+| --- | --- |
+| `test/fake-drive.js` | In-memory fake of the Drive REST endpoints used by `DriveStore`. It can inject chunk failures that store half a chunk and then return 503 |
+| `test/backup.test.js` | Orchestration with a fake SQL client that writes random bytes as the "`.bak`": partial failure, round trip, retention, checksum mismatch |
+| `test/transform.test.js`, `test/review-fixes.test.js` | Encryption round trips at segment boundaries, plus tamper, truncation, reorder and wrong-key detection |
+| `test/drive.test.js` | Folder creation and reuse, chunked upload and resume, list, download, delete, retry rules |
+| `test/auth.test.js` | Token file permissions, the loopback server (good state, CSRF state, denial, timeout, multibyte state) and logout |
+| `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `scheduler`, `cli` | Unit tests for the pure parts |
+
+Testing patterns to reuse:
+- `DriveStore` takes any `request(opts) → {status, data, headers}` function. In production that is `OAuth2Client#request`. In tests, use `createFakeDriveApi().request`.
+- `MssqlClient` takes `{ driver }`. Fake `ConnectionPool` and `NVarChar` the way `test/mssql.test.js` does.
+- Pass `logger: silentLogger` and a deterministic `now` to orchestration functions.
+
+### How to make common changes
+
+- **Add a config option.** Validate it and give it a default in `normalizeConfig` (`src/config.js`); use `bool()` for booleans.
+  Then document it in the README config table, add it to `backup-manager.example.json`, and add a case to `test/config.test.js`.
+- **Add a CLI command.** Add a `case` in `main()` (`src/cli.js`), any new flags to `OPTIONS`, and a line in `USAGE`.
+  Keep the logic in `src/backup.js`, or in a new module that takes injected dependencies, so it can be tested.
+- **Add a storage backend** (S3, OneDrive, …). Implement the same surface `backup.js` uses from `DriveStore`:
+  `ensurePath`, `resolvePath`, `listSubfolders`, `listBackups`, `getFile`, `uploadResumable`, `download` and `deleteFile`.
+  Uploaded files must keep the `appProperties` semantics (or an equivalent metadata store).
+- **Change the backup SQL.** Edit `buildBackupSql` and `buildVerifySql` in `src/mssql.js` and update `test/mssql.test.js`. Keep invariants 1 and 2.
+- **Add notifications** (email, Slack). Hook into the result of `runBackups()` in `cli.js` (`backup` and `schedule` cases). Don't put them inside `backupOne`.
+
+### Deliberately out of scope
+
+- Web UI, Docker image, automatic `RESTORE DATABASE` into SQL Server, multi-user tenancy, notifications and service-account auth.
+- Differential and transaction-log backups. Every backup is a full `COPY_ONLY` backup.
+- Per-database retention overrides. Retention is global and applied separately to each database's folder.
+
+### Known follow-ups (non-blocking review notes)
+
+- `createEncryptStream` and `createDecryptStream` concatenate each incoming chunk onto a pending buffer of up to 1 MiB. A chunk list
+  with a running byte count would reduce memory copying on very large backups.
+- The rate-limit 403 check reads `err.response.data` as JSON. For streamed downloads that is a stream, so
+  rate-limit 403s during `download` are not retried.
+- When an upload makes no progress (repeated 308 at the same offset), it retries immediately with no backoff.
 
 ## Development
 
 ```bash
-npm test     # node:test unit tests; SQL Server and Google Drive are faked
+npm install
+npm test                         # all unit tests (no network, no SQL Server)
+node --test test/drive.test.js   # a single file
+LOG_LEVEL=debug node bin/backup-manager.js backup --db Sales -c ./backup-manager.json
 ```
 
 ## Known issues
