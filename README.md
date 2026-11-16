@@ -90,6 +90,7 @@ Any string value can be written as `"env:VAR_NAME"` to read it from the environm
 | `encryption.enabled` / `keyEnv` | `false` / `BACKUP_ENCRYPTION_KEY` | AES-256-GCM. The key is 32 bytes, base64 or hex |
 | `workDir` | OS temp dir + `/backup-manager` | Scratch space for compressed or encrypted files |
 | `schedule.cron` / `timezone` | — | Used by `backup-manager schedule` |
+| `monitoring.heartbeatUrl` | — (off) | Healthchecks.io ping URL (`https://` only). See *Monitoring* |
 
 **Retention:** a backup is kept if **any** configured rule keeps it. That means it is either one of the newest
 `keepLast`, or younger than `keepDays`. The newest backup is never deleted. With no rules set,
@@ -147,6 +148,43 @@ system cron, for example:
 0 2 * * * cd /opt/backup-manager && ./bin/backup-manager.js backup >> /var/log/backup-manager.log 2>&1
 ```
 
+## Monitoring (Healthchecks.io)
+
+The tool can send a heartbeat to [Healthchecks.io](https://healthchecks.io) (the free plan has 20 checks), so
+you get an email when a client's backups **stop**. You don't have to log in to the client's server to check.
+
+How it works:
+- After each `backup` or scheduled run, the tool pings the check **only if every database succeeded**.
+  The request body is a short summary, for example `3/3 OK` followed by one line per database with its file name and size.
+  You can read it in the check's event log. It never contains passwords, keys or backup data.
+- If any database fails, **no ping is sent**. If the server is off, the task isn't running, or backups keep
+  failing, the pings stop and Healthchecks.io alerts you.
+- The ping is best-effort. It times out after 10 s and is retried up to 3 times. If it still fails, a warning is logged.
+  A failed ping never changes the backup result or the exit code.
+
+Setup, once per client server:
+1. On Healthchecks.io, click **Add Check** and give it the client's name.
+2. Set **Period = 1 day** and **Grace Time = 4 days**. The alert then fires after **5 days** without a successful backup.
+   For backups that run every day, a shorter grace time catches problems sooner.
+3. Copy the check's ping URL (`https://hc-ping.com/<uuid>`) into that client's config:
+   ```json
+   "monitoring": { "heartbeatUrl": "env:HEALTHCHECK_URL" }
+   ```
+   You can also paste the URL directly. Treat it like a password, because anyone with the URL can send pings.
+   If you use `env:HEALTHCHECK_URL`, that variable **must be set**: a missing variable is a config error
+   for every command, so a typo can't switch monitoring off without anyone noticing. To turn monitoring off, remove the
+   `monitoring` section or set `"heartbeatUrl": ""`.
+   `backup-manager.example.json` contains a placeholder URL. The tool refuses to start until you replace it or remove the section.
+4. Under **Integrations**, set the email address (or Telegram, Slack, …) that should get the alert.
+
+If you leave `monitoring` out, or leave `heartbeatUrl` empty, the tool sends nothing.
+
+Note: a manual run limited with `--server` or `--db` also pings when the databases it backed up all succeeded.
+If Healthchecks.io can't be reached, a one-shot `backup` can take up to about 45 s longer to exit:
+3 attempts with 10 s timeouts, plus the network library's connect timeout. The exit code is unaffected.
+
+## Logs
+
 Logs are JSON lines on stderr. The level is set by `LOG_LEVEL`: `debug|info|warn|error`. Passwords, tokens and keys
 are redacted.
 
@@ -185,6 +223,8 @@ reading every file first. Everything above it describes how to *use* the tool.
 | `src/naming.js` | File names, timestamps, server-side path joining (Windows or Linux), artifact suffixes | `backupBaseName`, `joinServerPath`, `artifactName`, `parseArtifactName` |
 | `src/scheduler.js` | Cron wrapper with an in-process overlap guard | `startScheduler`, `nonOverlapping` |
 | `src/logger.js` | JSON-lines logger to stderr with secret redaction | `createLogger`, `redact`, `silentLogger` |
+| `src/heartbeat.js` | Healthchecks.io ping after a fully successful run (best-effort, never throws) | `sendHeartbeat`, `buildSummary` |
+| `src/format.js` | Shared formatting helpers | `fmtBytes` |
 
 ### Data flow of `backup` (one database)
 
@@ -208,6 +248,8 @@ selectTargets(config, {server, db})            # which (server, db) pairs; error
 
 `runBackups()` returns `{ results: [{server, db, ok, fileId?, name?, bytes?, deleted?, retentionError?, error?, durationMs?}], failed }`.
 The CLI exits with `1` when `failed > 0`.
+After printing the results, `cli.js` calls `sendHeartbeat({ url: config.monitoring.heartbeatUrl, results, failed })`.
+It pings only when `failed === 0` and at least one database ran.
 
 ### Storage layout and metadata on Google Drive
 

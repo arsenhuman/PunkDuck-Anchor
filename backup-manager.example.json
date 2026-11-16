@@ -36,5 +36,8 @@
   "schedule": {
     "cron": "0 2 * * *",
     "timezone": "UTC"
+  },
+  "monitoring": {
+    "heartbeatUrl": "https://hc-ping.com/REPLACE-WITH-YOUR-CHECK-UUID"
   }
 }

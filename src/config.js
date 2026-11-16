@@ -129,6 +129,25 @@ export function normalizeConfig(raw, { env = process.env } = {}) {
     schedule = { cron: c.schedule.cron, timezone: c.schedule.timezone };
   }
 
+  // monitoring (optional Healthchecks.io heartbeat)
+  const monitoring = { heartbeatUrl: undefined };
+  if (c.monitoring !== undefined) {
+    req(c.monitoring && typeof c.monitoring === 'object' && !Array.isArray(c.monitoring), 'monitoring must be an object');
+    const u = c.monitoring.heartbeatUrl;
+    if (u !== undefined && u !== '') {
+      let parsed;
+      try {
+        parsed = new URL(u);
+      } catch {
+        parsed = null;
+      }
+      req(typeof u === 'string' && parsed && parsed.protocol === 'https:',
+        'monitoring.heartbeatUrl must be an https:// URL (e.g. https://hc-ping.com/<uuid>)');
+      req(!/REPLACE-WITH/i.test(u), 'monitoring.heartbeatUrl is still the example placeholder: paste your check\'s ping URL');
+      monitoring.heartbeatUrl = u;
+    }
+  }
+
   return {
     google,
     drive: { rootFolder: rootFolder.trim() },
@@ -138,6 +157,7 @@ export function normalizeConfig(raw, { env = process.env } = {}) {
     encryption,
     workDir: path.resolve(expandHome(c.workDir || path.join(os.tmpdir(), 'backup-manager'))),
     schedule,
+    monitoring,
   };
 }
 

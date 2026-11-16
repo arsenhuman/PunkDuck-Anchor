@@ -4,6 +4,8 @@ import * as auth from './auth.js';
 import { downloadBackup, listBackups, runBackups } from './backup.js';
 import { DEFAULT_CONFIG_PATH, loadConfig } from './config.js';
 import { DriveStore } from './drive.js';
+import { fmtBytes } from './format.js';
+import { sendHeartbeat } from './heartbeat.js';
 import { createLogger } from './logger.js';
 import { MssqlClient } from './mssql.js';
 import { startScheduler } from './scheduler.js';
@@ -37,17 +39,6 @@ const OPTIONS = {
   force: { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
 };
-
-function fmtBytes(n) {
-  if (!Number.isFinite(n)) return '?';
-  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  let i = 0;
-  while (n >= 1024 && i < u.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
-}
 
 async function makeDrive(config, logger) {
   const client = await auth.getAuthorizedClient(config.google);
@@ -117,6 +108,7 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
           ? `OK    ${r.server}/${r.db}  ${r.name}  ${fmtBytes(r.bytes)}  (${r.deleted} old removed)${r.retentionError ? `  [retention failed: ${r.retentionError}]` : ''}`
           : `FAIL  ${r.server}/${r.db}  ${r.error}`);
       }
+      await sendHeartbeat({ url: config.monitoring.heartbeatUrl, results, failed, logger });
       return failed ? 1 : 0;
     }
 
@@ -154,6 +146,7 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
           const drive = await makeDrive(config, logger);
           const { results, failed } = await runBackups({ config, drive, logger, createSqlClient: (s) => new MssqlClient(s) });
           logger.info('scheduled run finished', { total: results.length, failed });
+          await sendHeartbeat({ url: config.monitoring.heartbeatUrl, results, failed, logger });
         },
       });
       await new Promise((resolve) => {
