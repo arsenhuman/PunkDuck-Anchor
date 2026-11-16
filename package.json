@@ -1,0 +1,28 @@
+{
+  "name": "backup-manager",
+  "version": "0.1.0",
+  "description": "Native MSSQL backups uploaded to Google Drive via OAuth",
+  "type": "module",
+  "bin": {
+    "backup-manager": "bin/backup-manager.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "google-auth-library": "^9.15.1",
+    "mssql": "^10.0.5",
+    "node-cron": "^4.6.0"
+  },
+  "overrides": {
+    "@typespec/ts-http-runtime": {
+      "https-proxy-agent": "^7.0.6",
+      "http-proxy-agent": "^7.0.2"
+    }
+  }
+}

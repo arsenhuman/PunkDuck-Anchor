@@ -1,0 +1,40 @@
+{
+  "google": {
+    "clientId": "1234567890-abc.apps.googleusercontent.com",
+    "clientSecret": "env:GOOGLE_CLIENT_SECRET",
+    "tokenFile": "~/.config/backup-manager/token.json"
+  },
+  "drive": {
+    "rootFolder": "MSSQL Backups"
+  },
+  "servers": [
+    {
+      "name": "prod",
+      "host": "127.0.0.1",
+      "port": 1433,
+      "user": "backup_user",
+      "password": "env:MSSQL_PASSWORD",
+      "encrypt": true,
+      "trustServerCertificate": false,
+      "databases": ["Sales", "HR"],
+      "backupDir": "/var/opt/mssql/backup",
+      "localBackupDir": "/var/opt/mssql/backup",
+      "nativeCompression": false,
+      "requestTimeoutMs": 21600000
+    }
+  ],
+  "retention": {
+    "keepLast": 7,
+    "keepDays": 30
+  },
+  "compression": true,
+  "encryption": {
+    "enabled": true,
+    "keyEnv": "BACKUP_ENCRYPTION_KEY"
+  },
+  "workDir": "/var/tmp/backup-manager",
+  "schedule": {
+    "cron": "0 2 * * *",
+    "timezone": "UTC"
+  }
+}

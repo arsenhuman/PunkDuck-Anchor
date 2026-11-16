@@ -1,0 +1,9 @@
+node_modules/
+backup-manager.json
+token.json
+*.bak
+*.bak.gz
+*.bak.enc
+*.bak.gz.enc
+*.download
+*.partial
