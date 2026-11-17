@@ -14,8 +14,12 @@
     The matching .sha256 file must be next to it.
 
 .PARAMETER RestoreOnly
-    Restore machine for another client's backups (see RESTORE.md): skip the scheduled task and the first backup,
-    so nothing is ever uploaded from this machine.
+    Restore machine for another client's backups (see RESTORE.md): skip SQL Server preparation, the SQL checks,
+    the scheduled task and the first backup, so nothing is ever uploaded from this machine.
+
+.PARAMETER SkipSqlSetup
+    Do not prepare SQL Server (login, permissions, mixed mode, TCP/IP). For machines where the client's DBA
+    manages SQL Server: the DBA runs sql-prepare.sql from the program folder instead.
 
 .EXAMPLE
     irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
@@ -28,6 +32,7 @@ param(
     [string]$Version,
     [string]$ZipPath,
     [switch]$RestoreOnly,
+    [switch]$SkipSqlSetup,
     [string]$Repo = 'arsenhuman/PunkDuck-Anchor'
 )
 
@@ -180,6 +185,9 @@ function Initialize-EnvFile {
     Write-Host "Created $EnvFile from the template."
     Write-Host 'Fill in the settings in Notepad, save (Ctrl+S) and close Notepad.' -ForegroundColor Yellow
     Write-Host 'Leave BACKUP_ENCRYPTION_KEY empty: a key is generated in the next step.' -ForegroundColor Yellow
+    if (-not $RestoreOnly) {
+        Write-Host 'Leave SQL_PASSWORD empty: the installer creates the SQL login and fills it in.' -ForegroundColor Yellow
+    }
     Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$EnvFile`"" -Wait
     # Windows 11 Notepad may return immediately (tabs in an already open window), so ask as well.
     Read-Host 'Press Enter when the file is saved' | Out-Null
@@ -222,39 +230,524 @@ function Register-BackupTask {
     Write-Host "Scheduled task '$TaskName': daily at $time as SYSTEM."
 }
 
+# ---------------------------------------------------------------------------------------------
+# SQL Server preparation (step 7)
+#
+# Security invariant: every T-SQL text below is a constant single-quoted string. Login names,
+# database names and the password reach SQL Server only as SqlParameters; DDL that cannot take
+# parameters (CREATE LOGIN/USER, ALTER ROLE, GRANT) is built INSIDE T-SQL with QUOTENAME() and run
+# with sp_executesql. Never build SQL text in PowerShell. test/install-functions.ps1 enforces this.
+# ---------------------------------------------------------------------------------------------
+
+$SqlWhoAmI = 'SELECT CAST(IS_SRVROLEMEMBER(''sysadmin'') AS int) AS is_sysadmin, SUSER_SNAME() AS login_name;'
+
+$SqlDatabaseState = 'SELECT state_desc, CAST(is_read_only AS int) AS is_read_only FROM sys.databases WHERE name = @db;'
+
+$SqlLoginType = 'SELECT type FROM sys.server_principals WHERE name = @login;'
+
+# Creates the login, or resets its password if it exists. Returns 'created' or 'password reset'.
+$SqlSetLoginPassword = @'
+DECLARE @result nvarchar(20) = CASE WHEN SUSER_ID(@login) IS NULL THEN N'created' ELSE N'password reset' END;
+DECLARE @sql nvarchar(max);
+IF @result = N'created'
+    SET @sql = N'CREATE LOGIN ' + QUOTENAME(@login) + N' WITH PASSWORD = N' + QUOTENAME(@pw, '''') + N', CHECK_POLICY = ON';
+ELSE
+    SET @sql = N'ALTER LOGIN ' + QUOTENAME(@login) + N' WITH PASSWORD = N' + QUOTENAME(@pw, '''');
+EXEC sys.sp_executesql @sql;
+SELECT @result;
+'@
+
+# A password-expiry policy must never silently stop the nightly backups.
+$SqlLoginOptions = @'
+DECLARE @sql nvarchar(max) = N'ALTER LOGIN ' + QUOTENAME(@login) + N' WITH CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = [master]; '
+    + N'ALTER LOGIN ' + QUOTENAME(@login) + N' ENABLE;';
+EXEC sys.sp_executesql @sql;
+'@
+
+# Runs $SqlUserGrantsInner in database @db (<db>.sys.sp_executesql runs in that database).
+$SqlInDatabase = @'
+DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';
+DECLARE @result nvarchar(20);
+EXEC @proc @inner, N'@login sysname, @isMaster int, @result nvarchar(20) OUTPUT',
+    @login = @login, @isMaster = @isMaster, @result = @result OUTPUT;
+SELECT @result;
+'@
+
+# In the current database: make sure a user maps to the login, then grant what backup-manager needs.
+# master: GRANT CREATE DATABASE (RESTORE VERIFYONLY needs it). Other databases: db_backupoperator.
+# Returns 'created', 'remapped' (orphaned user after a restore from another server) or 'kept'.
+$SqlUserGrantsInner = @'
+DECLARE @sid varbinary(85) = SUSER_SID(@login);
+DECLARE @user sysname, @sql nvarchar(max);
+SELECT @user = name FROM sys.database_principals WHERE sid = @sid;
+IF @user IS NOT NULL
+    SET @result = N'kept';
+ELSE IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @login)
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @login AND type = 'S')
+        THROW 50001, N'A database principal with the name of SQL_USER exists but is not a SQL user. Choose another SQL_USER.', 1;
+    SET @sql = N'ALTER USER ' + QUOTENAME(@login) + N' WITH LOGIN = ' + QUOTENAME(@login);
+    EXEC sys.sp_executesql @sql;
+    SELECT @user = @login, @result = N'remapped';
+END
+ELSE
+BEGIN
+    SET @sql = N'CREATE USER ' + QUOTENAME(@login) + N' FOR LOGIN ' + QUOTENAME(@login);
+    EXEC sys.sp_executesql @sql;
+    SELECT @user = @login, @result = N'created';
+END
+IF @user <> N'dbo'
+BEGIN
+    IF @isMaster = 1
+    BEGIN
+        SET @sql = N'GRANT CREATE DATABASE TO ' + QUOTENAME(@user);
+        EXEC sys.sp_executesql @sql;
+    END
+    ELSE IF NOT EXISTS (
+        SELECT 1 FROM sys.database_role_members rm
+        JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
+        JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+        WHERE r.name = N'db_backupoperator' AND m.name = @user)
+    BEGIN
+        SET @sql = N'ALTER ROLE db_backupoperator ADD MEMBER ' + QUOTENAME(@user);
+        EXEC sys.sp_executesql @sql;
+    END
+END
+'@
+
+$SqlIntegratedOnly = 'SELECT CAST(SERVERPROPERTY(''IsIntegratedSecurityOnly'') AS int);'
+
+# What SSMS does for "SQL Server and Windows Authentication mode". Takes effect after a restart.
+$SqlEnableMixedMode = 'EXEC master.dbo.xp_instance_regwrite N''HKEY_LOCAL_MACHINE'', N''Software\Microsoft\MSSQLServer\MSSQLServer'', N''LoginMode'', REG_DWORD, 2;'
+
+$SqlPing = 'SELECT 1;'
+
+$SqlPrepareScript = Join-Path $InstallDir 'sql-prepare.sql'
+
+# ---- pure helpers (tested by test/install-functions.ps1) ----
+
+# Same rule as the program (src/envconfig.js isLocalSqlHost).
+function Test-LocalSqlHost([string]$SqlHost, [string]$ComputerName = $env:COMPUTERNAME) {
+    $h = "$SqlHost".Trim().ToLowerInvariant()
+    if (-not $h) { return $false }
+    if (@('localhost', '127.0.0.1', '::1', '.', '(local)') -contains $h) { return $true }
+    return [bool]($ComputerName -and $h -eq $ComputerName.ToLowerInvariant())
+}
+
+# Service, shared-memory data source and WMI instance name for SQL_INSTANCE / SQL_PORT.
+# NeedsBrowser mirrors src/envconfig.js: a named instance is looked up through SQL Browser unless
+# SQL_PORT is set to something other than 1433.
+function Resolve-SqlInstance([string]$Instance, [string]$Port) {
+    $name = "$Instance".Trim()
+    $p = "$Port".Trim()
+    if (-not $name) {
+        return @{ ServiceName = 'MSSQLSERVER'; DataSource = 'lpc:.'; InstanceName = 'MSSQLSERVER'; IsNamed = $false; NeedsBrowser = $false }
+    }
+    return @{
+        ServiceName  = 'MSSQL$' + $name
+        DataSource   = 'lpc:.\' + $name
+        InstanceName = $name
+        IsNamed      = $true
+        NeedsBrowser = (-not $p -or $p -eq '1433')
+    }
+}
+
+# SQL_USER must be a plain SQL login name (not DOMAIN\user), at most 128 characters.
+function Test-SqlLoginName([string]$Name) {
+    if (-not $Name -or $Name.Length -gt 128) { return $false }
+    if ($Name -match '[\\\x00-\x1f]') { return $false }
+    return $true
+}
+
+function Split-DatabaseList([string]$Value) {
+    return @("$Value" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+# Letters and digits only (safe in the env file and in T-SQL), with at least one upper-case letter,
+# one lower-case letter and one digit, so it passes CHECK_POLICY. Unbiased (rejection sampling).
+function New-SqlLoginPassword([int]$Length = 32) {
+    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    $limit = 256 - (256 % $chars.Length)
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try {
+        $buf = New-Object byte[] 1
+        do {
+            $sb = New-Object System.Text.StringBuilder
+            while ($sb.Length -lt $Length) {
+                $rng.GetBytes($buf)
+                if ($buf[0] -lt $limit) { [void]$sb.Append($chars[$buf[0] % $chars.Length]) }
+            }
+            $pw = $sb.ToString()
+        } until ($pw -cmatch '[A-Z]' -and $pw -cmatch '[a-z]' -and $pw -match '[0-9]')
+        return $pw
+    } finally {
+        $rng.Dispose()
+    }
+}
+
+# Newest SQL Server WMI provider namespace (ComputerManagement13 = 2016 ... 17 = 2025), or $null.
+function Select-SqlWmiNamespace([string[]]$Names) {
+    $best = -1
+    foreach ($n in $Names) {
+        if ($n -match '^ComputerManagement(\d+)$' -and [int]$Matches[1] -gt $best) { $best = [int]$Matches[1] }
+    }
+    if ($best -lt 0) { return $null }
+    return "root\Microsoft\SqlServer\ComputerManagement$best"
+}
+
+# Default instance: what to do with the IPAll TcpPort. Returns @{ Action = 'set' | 'keep' | 'adopt'; Port }.
+#   set:   no static port yet -> set SQL_PORT (1433 if empty); needs a restart
+#   keep:  SQL_PORT is already one of the static ports
+#   adopt: another static port is configured -> keep it, write it to SQL_PORT (no restart)
+function Get-TcpPortPlan([string]$Current, [string]$Wanted) {
+    $want = if ("$Wanted".Trim()) { "$Wanted".Trim() } else { '1433' }
+    $ports = @("$Current" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($ports.Count -eq 0) { return @{ Action = 'set'; Port = $want } }
+    if ($ports -contains $want) { return @{ Action = 'keep'; Port = $want } }
+    return @{ Action = 'adopt'; Port = $ports[0] }
+}
+
+# ---- SQL Server access (Windows authentication over shared memory) ----
+
+# Runs one constant T-SQL text with parameters. Strings go in as NVarChar, integers as Int.
+# Returns the rows, or the first column of the first row with -Scalar.
+function Invoke-SqlAdmin {
+    param([string]$DataSource, [string]$Sql, [hashtable]$Params = @{}, [switch]$Scalar)
+    $csb = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $csb['Data Source'] = $DataSource
+    $csb['Integrated Security'] = $true
+    $csb['Encrypt'] = $false
+    $csb['Connect Timeout'] = 15
+    $csb['Application Name'] = "$AppName installer"
+    $conn = New-Object System.Data.SqlClient.SqlConnection($csb.ConnectionString)
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $Sql
+        $cmd.CommandTimeout = 120
+        foreach ($key in $Params.Keys) {
+            $value = $Params[$key]
+            if ($value -is [int]) {
+                $p = $cmd.Parameters.Add("@$key", [System.Data.SqlDbType]::Int)
+            } else {
+                $value = [string]$value
+                $size = if ($value.Length -gt 4000) { -1 } else { 4000 }
+                $p = $cmd.Parameters.Add("@$key", [System.Data.SqlDbType]::NVarChar, $size)
+            }
+            $p.Value = $value
+        }
+        if ($Scalar) {
+            $v = $cmd.ExecuteScalar()
+            if ($v -is [DBNull]) { return $null }
+            return $v
+        }
+        $table = New-Object System.Data.DataTable
+        $table.Load($cmd.ExecuteReader())
+        foreach ($row in $table.Rows) { $row }
+    } catch {
+        # .NET errors arrive wrapped (MethodInvocationException): find the SqlException and print
+        # "Msg 262: ... | Msg 3013: ...", like the program prints SQL errors.
+        $ex = $_.Exception
+        while ($ex -and -not ($ex -is [System.Data.SqlClient.SqlException])) { $ex = $ex.InnerException }
+        if (-not $ex) { throw }
+        $msgs = @($ex.Errors | ForEach-Object { "Msg $($_.Number): $($_.Message)" })
+        throw ($msgs -join ' | ')
+    } finally {
+        $conn.Dispose()
+    }
+}
+
+function Wait-SqlServer([string]$DataSource, [int]$TimeoutSeconds = 90) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-SqlAdmin -DataSource $DataSource -Sql $SqlPing -Scalar | Out-Null
+            return $true
+        } catch {
+            Start-Sleep -Seconds 3
+        }
+    }
+    return $false
+}
+
+# ---- SQL Server network settings (the WMI provider SQL Server Configuration Manager uses) ----
+
+function Get-SqlWmiNamespace {
+    try {
+        $names = @(Get-CimInstance -Namespace 'root\Microsoft\SqlServer' -ClassName '__NAMESPACE' -ErrorAction Stop | ForEach-Object { $_.Name })
+    } catch {
+        return $null
+    }
+    return Select-SqlWmiNamespace $names
+}
+
+function Get-SqlTcpProtocol([string]$Namespace, [string]$InstanceName) {
+    Get-CimInstance -Namespace $Namespace -ClassName 'ServerNetworkProtocol' -ErrorAction Stop |
+        Where-Object { $_.InstanceName -eq $InstanceName -and $_.ProtocolName -eq 'Tcp' } |
+        Select-Object -First 1
+}
+
+function Get-SqlIpAllProperty([string]$Namespace, [string]$InstanceName, [string]$PropertyName) {
+    Get-CimInstance -Namespace $Namespace -ClassName 'ServerNetworkProtocolProperty' -ErrorAction Stop |
+        Where-Object { $_.InstanceName -eq $InstanceName -and $_.ProtocolName -eq 'Tcp' -and
+                       $_.IPAddressName -eq 'IPAll' -and $_.PropertyName -eq $PropertyName } |
+        Select-Object -First 1
+}
+
+function Assert-CimResult($Result, [string]$What) {
+    if ($Result.ReturnValue -ne 0) { throw "$What failed (WMI return value $($Result.ReturnValue))." }
+}
+
+function Write-ManualTcpHelp([hashtable]$Inst) {
+    Write-Host 'Enable TCP/IP by hand:' -ForegroundColor Yellow
+    Write-Host "  SQL Server Configuration Manager > SQL Server Network Configuration > Protocols for $($Inst.InstanceName)" -ForegroundColor Yellow
+    Write-Host '  > TCP/IP > Enabled = Yes; for the default instance also IP Addresses > IPAll > TCP Port = 1433.' -ForegroundColor Yellow
+    Write-Host '  Then restart the SQL Server service and run the installer again.' -ForegroundColor Yellow
+}
+
+# Stops the SQL Server service, starts it again with the dependent services that were running
+# (e.g. SQL Server Agent), and waits until it accepts connections.
+function Restart-SqlServer([hashtable]$Inst) {
+    $svc = Get-Service -Name $Inst.ServiceName
+    $dependents = @($svc.DependentServices | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
+    Write-Host "Restarting $($Inst.ServiceName) ..."
+    Stop-Service -Name $Inst.ServiceName -Force
+    Start-Service -Name $Inst.ServiceName
+    foreach ($d in $dependents) { Start-Service -Name $d }
+    if (-not (Wait-SqlServer $Inst.DataSource 90)) {
+        throw "SQL Server did not accept connections within 90 seconds after the restart. Check services.msc and the SQL Server error log."
+    }
+    if ($dependents.Count) { Write-Host "Started again: $($dependents -join ', ')" }
+}
+
+function Write-SqlPrepareHelp {
+    Write-Host "A SQL Server sysadmin (e.g. the client's DBA) can prepare SQL Server by hand with:" -ForegroundColor Yellow
+    Write-Host "  $SqlPrepareScript" -ForegroundColor Yellow
+    Write-Host 'Then run the installer again with -SkipSqlSetup (see README, "SQL Server preparation").' -ForegroundColor Yellow
+}
+
+# Step 7. Idempotent: running it again changes only what is still missing.
+function Initialize-SqlServer {
+    $sqlHost = Get-EnvValue $EnvFile 'SQL_HOST'
+    if (-not $sqlHost) { $sqlHost = 'localhost' }
+    if (-not (Test-LocalSqlHost $sqlHost)) {
+        Write-Host "SQL_HOST=$sqlHost is not this machine: skipping SQL Server preparation."
+        return
+    }
+    $inst = Resolve-SqlInstance (Get-EnvValue $EnvFile 'SQL_INSTANCE') (Get-EnvValue $EnvFile 'SQL_PORT')
+    $login = Get-EnvValue $EnvFile 'SQL_USER'
+    if (-not (Test-SqlLoginName $login)) {
+        throw "SQL_USER '$login' is not a valid SQL login name (no DOMAIN\user, at most 128 characters). Fix it in $EnvFile."
+    }
+    $databases = Split-DatabaseList (Get-EnvValue $EnvFile 'SQL_DATABASES')
+    if ($databases.Count -eq 0) { throw "SQL_DATABASES is empty. Fix it in $EnvFile." }
+    $summary = New-Object 'System.Collections.Generic.List[string]'
+
+    # 1. The service
+    $svc = Get-Service -Name $inst.ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        $found = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        $list = if ($found.Count) { $found -join ', ' } else { 'none' }
+        throw "SQL Server service $($inst.ServiceName) not found (installed: $list). Fix SQL_INSTANCE in $EnvFile (empty for MSSQLSERVER, otherwise the part after MSSQL`$)."
+    }
+    if ($svc.Status -ne 'Running') {
+        Write-Host "Starting $($inst.ServiceName) ..."
+        Start-Service -Name $inst.ServiceName
+        if (-not (Wait-SqlServer $inst.DataSource 90)) { throw "SQL Server ($($inst.ServiceName)) did not start." }
+    }
+
+    # 2. Connect as the technician (Windows authentication) and require sysadmin
+    try {
+        $me = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlWhoAmI)[0]
+    } catch {
+        Write-Host "Could not connect to SQL Server ($($inst.DataSource)) with your Windows account: $($_.Exception.Message)" -ForegroundColor Red
+        Write-SqlPrepareHelp
+        throw 'SQL Server preparation needs a SQL Server sysadmin.'
+    }
+    if ($me.is_sysadmin -ne 1) {
+        Write-Host "Your Windows account ($($me.login_name)) is not a sysadmin on this SQL Server." -ForegroundColor Red
+        Write-SqlPrepareHelp
+        throw 'SQL Server preparation needs a SQL Server sysadmin.'
+    }
+    Write-Host "Connected to $($inst.InstanceName) as $($me.login_name) (sysadmin)."
+
+    # 3. Databases: all must exist, be ONLINE and writable before anything is created
+    foreach ($db in $databases) {
+        $row = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlDatabaseState -Params @{ db = $db })[0]
+        if (-not $row) { throw "Database '$db' (SQL_DATABASES) does not exist on $($inst.InstanceName). Fix the name in $EnvFile (as shown in SSMS)." }
+        if ($row.state_desc -ne 'ONLINE') { throw "Database '$db' is $($row.state_desc), not ONLINE." }
+        if ($row.is_read_only -eq 1) { throw "Database '$db' is read-only: the installer cannot add the backup user. Make it writable or prepare it with sql-prepare.sql." }
+    }
+
+    # 4. The login
+    $loginType = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginType -Params @{ login = $login } -Scalar
+    if ($loginType -and $loginType -ne 'S') {
+        throw "A Windows login or group named '$login' exists. SQL_USER must be a SQL login: choose another SQL_USER in $EnvFile."
+    }
+    if (-not (Get-EnvValue $EnvFile 'SQL_PASSWORD')) {
+        # Change SQL Server first, then the env file: a failure never leaves a password SQL Server doesn't know.
+        $pw = New-SqlLoginPassword
+        try {
+            $done = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlSetLoginPassword -Params @{ login = $login; pw = $pw } -Scalar
+            Set-EnvValue $EnvFile 'SQL_PASSWORD' $pw
+        } finally {
+            Remove-Variable pw -ErrorAction SilentlyContinue
+        }
+        $summary.Add("Login $login`: $done (password stored in the env file)")
+    } elseif (-not $loginType) {
+        throw "SQL_PASSWORD is set but the login '$login' does not exist. Empty SQL_PASSWORD in $EnvFile and run the installer again to let it create the login."
+    } else {
+        $summary.Add("Login $login`: kept (password from the env file not changed)")
+    }
+    Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginOptions -Params @{ login = $login } | Out-Null
+
+    # 5. Users and grants
+    $r = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlInDatabase -Scalar `
+        -Params @{ db = 'master'; inner = $SqlUserGrantsInner; login = $login; isMaster = 1 }
+    $summary.Add("master: user $r, CREATE DATABASE granted")
+    foreach ($db in $databases) {
+        $r = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlInDatabase -Scalar `
+            -Params @{ db = $db; inner = $SqlUserGrantsInner; login = $login; isMaster = 0 }
+        $summary.Add("$db`: user $r, db_backupoperator")
+    }
+
+    # 6. SQL Browser for a named instance found through it (no SQL Server restart needed)
+    if ($inst.NeedsBrowser) {
+        $browser = Get-Service -Name 'SQLBrowser' -ErrorAction SilentlyContinue
+        if (-not $browser) {
+            throw "The SQL Server Browser service is not installed. Set SQL_PORT in $EnvFile to the fixed TCP port of $($inst.InstanceName) instead."
+        }
+        if ($browser.StartType -ne 'Automatic' -or $browser.Status -ne 'Running') {
+            Set-Service -Name 'SQLBrowser' -StartupType Automatic
+            Start-Service -Name 'SQLBrowser'
+            $summary.Add('SQL Server Browser: set to Automatic and started')
+        }
+    }
+
+    # 7. Settings that need a SQL Server restart: detect everything first, change nothing yet
+    $changes = New-Object 'System.Collections.Generic.List[string]'
+    $mixedOff = (Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlIntegratedOnly -Scalar) -eq 1
+    if ($mixedOff) { $changes.Add('Enable "SQL Server and Windows Authentication mode" (mixed mode)') }
+
+    $ns = Get-SqlWmiNamespace
+    if (-not $ns) {
+        Write-Host 'The SQL Server WMI provider (used by SQL Server Configuration Manager) was not found.' -ForegroundColor Red
+        Write-ManualTcpHelp $inst
+        throw 'Cannot check the TCP/IP settings automatically.'
+    }
+    $tcp = Get-SqlTcpProtocol $ns $inst.InstanceName
+    if (-not $tcp) {
+        Write-Host "No TCP/IP protocol entry for $($inst.InstanceName) in $ns." -ForegroundColor Red
+        Write-ManualTcpHelp $inst
+        throw 'Cannot check the TCP/IP settings automatically.'
+    }
+    if (-not $tcp.Enabled) { $changes.Add("Enable TCP/IP for $($inst.InstanceName)") }
+
+    $portPlan = $null
+    if (-not $inst.IsNamed) {
+        $portProp = Get-SqlIpAllProperty $ns $inst.InstanceName 'TcpPort'
+        $dynProp = Get-SqlIpAllProperty $ns $inst.InstanceName 'TcpDynamicPorts'
+        if (-not $portProp -or -not $dynProp) {
+            Write-ManualTcpHelp $inst
+            throw 'Cannot read the TCP port settings (IPAll) automatically.'
+        }
+        $portPlan = Get-TcpPortPlan $portProp.PropertyStrVal (Get-EnvValue $EnvFile 'SQL_PORT')
+        if ($portPlan.Action -eq 'set') {
+            $changes.Add("Set the static TCP port (IPAll) to $($portPlan.Port), no dynamic ports")
+        } elseif ($portPlan.Action -eq 'adopt') {
+            Set-EnvValue $EnvFile 'SQL_PORT' $portPlan.Port
+            $summary.Add("SQL_PORT set to $($portPlan.Port) (the port SQL Server already uses)")
+        }
+    }
+
+    if ($changes.Count -eq 0) {
+        $summary.Add('Server settings: nothing to change, no restart')
+    } else {
+        Write-Host ''
+        Write-Host 'SQL Server needs these settings changed:' -ForegroundColor Yellow
+        foreach ($c in $changes) { Write-Host "  - $c" -ForegroundColor Yellow }
+        Write-Host ''
+        Write-Host 'Applying this RESTARTS the SQL Server service. Everyone using this SQL Server' -ForegroundColor Yellow
+        Write-Host "(the client's application too) is disconnected for about 30 seconds." -ForegroundColor Yellow
+        $answer = Read-Host 'Type RESTART to apply now, or press Enter to stop and run the installer again later'
+        if ($answer -ne 'RESTART') {
+            throw 'Nothing was changed in the SQL Server settings. Run the installer again when a restart is OK.'
+        }
+        $applied = New-Object 'System.Collections.Generic.List[string]'
+        try {
+            if ($mixedOff) {
+                Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlEnableMixedMode | Out-Null
+                $applied.Add('mixed mode')
+            }
+            if (-not $tcp.Enabled) {
+                Assert-CimResult (Invoke-CimMethod -InputObject $tcp -MethodName 'SetEnable') 'Enabling TCP/IP'
+                $applied.Add('TCP/IP')
+            }
+            if ($portPlan -and $portPlan.Action -eq 'set') {
+                Assert-CimResult (Invoke-CimMethod -InputObject $portProp -MethodName 'SetStringValue' -Arguments @{ StrValue = $portPlan.Port }) 'Setting the TCP port'
+                Assert-CimResult (Invoke-CimMethod -InputObject $dynProp -MethodName 'SetStringValue' -Arguments @{ StrValue = '' }) 'Clearing the dynamic TCP port'
+                $applied.Add("TCP port $($portPlan.Port)")
+            }
+        } catch {
+            $done = if ($applied.Count) { $applied -join ', ' } else { 'nothing' }
+            throw "Changing the SQL Server settings failed: $($_.Exception.Message) Applied so far: $done (not active until SQL Server restarts). SQL Server was not restarted."
+        }
+        Restart-SqlServer $inst
+        $summary.Add("Server settings changed: $($applied -join ', '); SQL Server restarted")
+    }
+
+    Write-Host ''
+    Write-Host 'SQL Server preparation:' -ForegroundColor Green
+    foreach ($s in $summary) { Write-Host "  $s" }
+}
+
 function Install-BackupManager {
-    Write-Step '1/10 Checking prerequisites'
+    Write-Step '1/11 Checking prerequisites'
     Assert-Prerequisites
 
-    Write-Step '2/10 Getting the release package'
+    Write-Step '2/11 Getting the release package'
     $zip = Get-Package
 
-    Write-Step "3/10 Installing program files to $InstallDir"
+    Write-Step "3/11 Installing program files to $InstallDir"
     Install-ProgramFiles $zip
 
-    Write-Step "4/10 Settings ($EnvFile)"
+    Write-Step "4/11 Settings ($EnvFile)"
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
     Lock-Folder $DataDir   # before any secret is written there
     Initialize-EnvFile
 
-    Write-Step '5/10 Encryption key'
+    Write-Step '5/11 Encryption key'
     Initialize-EncryptionKey
 
-    Write-Step '6/10 Restricting folder access to SYSTEM and Administrators'
+    Write-Step '6/11 Restricting folder access to SYSTEM and Administrators'
     Lock-Folder $InstallDir
     Lock-Folder $DataDir
 
-    Write-Step '7/10 Checking settings, SQL Server and backup folder'
-    if ((Invoke-App check --skip-auth) -ne 0) {
+    Write-Step '7/11 Preparing SQL Server'
+    if ($RestoreOnly) {
+        Write-Host 'Skipped: a restore-only machine does not back up, so SQL Server is not prepared or checked.'
+    } elseif ($SkipSqlSetup) {
+        Write-Host 'Skipped (-SkipSqlSetup).'
+        Write-SqlPrepareHelp
+    } else {
+        Initialize-SqlServer
+    }
+
+    # A restore-only machine never connects to SQL Server from this program: skip the SQL checks.
+    $skipSql = @()
+    if ($RestoreOnly) { $skipSql = @('--skip-sql') }
+
+    Write-Step '8/11 Checking settings, SQL Server and backup folder'
+    if ((Invoke-App check --skip-auth @skipSql) -ne 0) {
         throw "Some checks failed (see above). Fix them in $EnvFile and run the installer again."
     }
 
-    Write-Step '8/10 Google sign-in'
+    Write-Step '9/11 Google sign-in'
     if ((Invoke-App auth status) -ne 0) {
         if ((Invoke-App auth login) -ne 0) { throw 'Google sign-in failed.' }
     }
     # Full check, now including Google: stops if the wrong account was signed in (GOOGLE_EMAIL).
-    if ((Invoke-App check) -ne 0) {
+    if ((Invoke-App check @skipSql) -ne 0) {
         throw 'The Google check failed (see above). Fix it (auth logout + auth login) and run the installer again.'
     }
 
@@ -264,10 +757,10 @@ function Install-BackupManager {
         return
     }
 
-    Write-Step '9/10 Scheduled task'
+    Write-Step '10/11 Scheduled task'
     Register-BackupTask
 
-    Write-Step '10/10 First backup'
+    Write-Step '11/11 First backup'
     if ((Invoke-App backup) -ne 0) {
         throw "The first backup failed (see above and the log in $LogDir)."
     }

@@ -3,6 +3,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { formatSqlError } from './mssql.js';
 import { artifactName, backupBaseName, joinServerPath, parseArtifactName } from './naming.js';
 import { selectForDeletion } from './retention.js';
 import { hashFile, packFile, unpackFile } from './transform.js';
@@ -142,7 +143,7 @@ export async function runBackups({ config, drive, createSqlClient, logger, filte
       await sqlClient.connect();
     } catch (err) {
       logger.error('cannot connect to SQL Server', { server: server.name, error: err });
-      for (const db of dbs) results.push({ server: server.name, db, ok: false, error: `connect failed: ${err.message}` });
+      for (const db of dbs) results.push({ server: server.name, db, ok: false, error: `connect failed: ${formatSqlError(err)}` });
       await sqlClient?.close().catch(() => {});
       continue;
     }
@@ -152,7 +153,7 @@ export async function runBackups({ config, drive, createSqlClient, logger, filte
           results.push(await backupOne({ config, server, db, sqlClient, drive, logger, now }));
         } catch (err) {
           logger.error('backup failed', { server: server.name, db, error: err });
-          results.push({ server: server.name, db, ok: false, error: err.message });
+          results.push({ server: server.name, db, ok: false, error: formatSqlError(err) });
         }
       }
     } finally {

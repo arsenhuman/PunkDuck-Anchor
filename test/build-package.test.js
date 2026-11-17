@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { nodeDistVersion, oauthClientJson, sha256, shaLine, verifyShasum, zipName } from '../scripts/build-package.js';
+import fs from 'node:fs';
+import { nodeDistVersion, oauthClientJson, PACKAGING_FILES, sha256, shaLine, verifyShasum, zipName } from '../scripts/build-package.js';
 
 test('verifyShasum checks the listed hash', () => {
   const buf = Buffer.from('node zip');
@@ -30,4 +31,12 @@ test('release file names', () => {
 test('Windows text files get CRLF line endings', async () => {
   const { toCrlf } = await import('../scripts/build-package.js');
   assert.equal(toCrlf('a\nb\r\nc\n'), 'a\r\nb\r\nc\r\n');
+});
+
+test('the zip ships sql-prepare.sql, and every packaging file exists and is pure ASCII', () => {
+  assert.ok(PACKAGING_FILES.includes('sql-prepare.sql'));
+  for (const f of PACKAGING_FILES) {
+    const buf = fs.readFileSync(new URL(`../packaging/${f}`, import.meta.url));
+    assert.ok(!buf.some((b) => b > 127), `${f} must be pure ASCII (Windows PowerShell 5.1 / SSMS read it as ANSI)`);
+  }
 });

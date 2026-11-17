@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildBackupSql, buildVerifySql, MssqlClient, toPoolConfig } from '../src/mssql.js';
+import { buildBackupSql, buildVerifySql, formatSqlError, MssqlClient, sqlErrorNumbers, toPoolConfig, VERIFY_PERMISSION_SQL } from '../src/mssql.js';
 
 test('backup SQL is parameterized and uses safe options', () => {
   const s = buildBackupSql();
@@ -57,4 +57,26 @@ test('assertDatabaseOnline rejects missing or offline databases', async () => {
   await assert.rejects(c.assertDatabaseOnline('nope'), /does not exist/);
   c = await new MssqlClient({ host: 'h' }, { driver: fakeDriver([{ state_desc: 'RESTORING' }]).driver }).connect();
   await assert.rejects(c.assertDatabaseOnline('x'), /RESTORING/);
+});
+
+test('formatSqlError lists the preceding server messages in order', () => {
+  const e262 = Object.assign(new Error("CREATE DATABASE permission denied in database 'master'."), { number: 262 });
+  const e3013 = Object.assign(new Error('VERIFY DATABASE is terminating abnormally.'), { number: 3013, precedingErrors: [e262] });
+  assert.equal(formatSqlError(e3013),
+    "Msg 262: CREATE DATABASE permission denied in database 'master'. | Msg 3013: VERIFY DATABASE is terminating abnormally.");
+  assert.deepEqual(sqlErrorNumbers(e3013), [262, 3013]);
+  assert.equal(formatSqlError(e262), "Msg 262: CREATE DATABASE permission denied in database 'master'.");
+  assert.equal(formatSqlError(Object.assign(new Error('x'), { precedingErrors: [] })), 'x');
+  assert.equal(formatSqlError(new Error('connect ECONNREFUSED 127.0.0.1:1433')), 'connect ECONNREFUSED 127.0.0.1:1433');
+  assert.deepEqual(sqlErrorNumbers(new Error('plain')), []);
+});
+
+test('canVerify asks for CREATE DATABASE in master with a constant query', async () => {
+  const { calls, driver } = fakeDriver([{ can_verify: 1 }]);
+  const c = await new MssqlClient({ host: 'h' }, { driver }).connect();
+  assert.equal(await c.canVerify(), true);
+  assert.equal(calls[0].text, VERIFY_PERMISSION_SQL);
+  assert.match(VERIFY_PERMISSION_SQL, /HAS_PERMS_BY_NAME\('master', 'DATABASE', 'CREATE DATABASE'\)/);
+  const no = await new MssqlClient({ host: 'h' }, { driver: fakeDriver([{ can_verify: 0 }]).driver }).connect();
+  assert.equal(await no.canVerify(), false);
 });

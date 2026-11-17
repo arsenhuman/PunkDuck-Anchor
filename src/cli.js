@@ -17,7 +17,8 @@ export const LOG_KEEP_DAYS = 30;
 export const USAGE = `Usage: backup-manager <command> [options]
 
 Commands:
-  check                                Verify settings, SQL Server, backup folder and Google sign-in
+  check [--skip-sql]                   Verify settings, SQL Server, backup folder and Google sign-in
+                                       (--skip-sql: restore-only machine, no SQL Server checks)
   auth login [--email you@gmail.com]   Connect a Google account (prints a sign-in URL)
   auth status                          Show the connected Google account
   auth logout                          Revoke and delete the stored Google sign-in
@@ -44,6 +45,7 @@ const OPTIONS = {
   json: { type: 'boolean', default: false },
   force: { type: 'boolean', default: false },
   'skip-auth': { type: 'boolean', default: false }, // check: used by install.ps1 before the first sign-in
+  'skip-sql': { type: 'boolean', default: false }, // check: restore-only machines (install.ps1 -RestoreOnly)
   help: { type: 'boolean', short: 'h', default: false },
 };
 
@@ -109,11 +111,13 @@ export async function main(argv, {
   }
 
   const paths = appPaths({ env });
-  const load = () => (opts.config ? loadConfig(opts.config) : loadEnvConfig(paths));
+  // Only commands that connect to SQL Server need SQL_PASSWORD (a restore-only machine has none).
+  const requireSql = cmd === 'backup' || (cmd === 'check' && !opts['skip-sql']);
+  const load = () => (opts.config ? loadConfig(opts.config) : loadEnvConfig(paths, { requireSql }));
 
   if (cmd === 'check') {
     const { ok, checks } = await runChecks({
-      loadConfig: load, createSqlClient, authStatus, skipAuth: opts['skip-auth'], envFile: paths.envFile,
+      loadConfig: load, createSqlClient, authStatus, skipAuth: opts['skip-auth'], skipSql: opts['skip-sql'], envFile: paths.envFile,
     });
     out(formatChecks(checks));
     out(ok ? '\nAll checks passed.' : '\nSome checks failed. Fix the problems above and run "backup-manager check" again.');

@@ -27,10 +27,17 @@ jobs:
         shell: powershell
         run: |
           $failed = $false
-          foreach ($f in Get-ChildItem packaging\*.ps1) {
+          foreach ($f in @(Get-ChildItem packaging\*.ps1) + @(Get-ChildItem test\*.ps1)) {
             $tokens = $null; $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
             foreach ($e in $errors) { Write-Host "$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
             if ([IO.File]::ReadAllBytes($f.FullName) | Where-Object { $_ -gt 127 }) { Write-Host "$($f.Name): non-ASCII characters"; $failed = $true }
           }
           if ($failed) { exit 1 }
+
+      # Pure functions of install.ps1 (password generator, instance resolution, ...) and the rule that
+      # its T-SQL is constant text. Loads only the function definitions, so nothing is installed.
+      - name: Test install.ps1 functions with Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File test\install-functions.ps1

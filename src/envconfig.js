@@ -62,6 +62,19 @@ export function defaultServerName(hostname = os.hostname()) {
   return s || 'server';
 }
 
+const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1', '.', '(local)'];
+
+/**
+ * True if SQL_HOST names this machine: localhost, a loopback address, "." / "(local)",
+ * or the computer name (case-insensitive).
+ */
+export function isLocalSqlHost(host, { hostname = os.hostname(), computerName = process.env.COMPUTERNAME } = {}) {
+  const h = String(host ?? '').trim().toLowerCase();
+  if (!h) return false;
+  if (LOCAL_HOSTS.includes(h)) return true;
+  return [hostname, computerName].some((n) => n && n.toLowerCase() === h);
+}
+
 function req(cond, msg) {
   if (!cond) throw new ConfigError(msg);
 }
@@ -85,8 +98,10 @@ function flag(vars, key, dflt) {
  * @param vars    parsed env file
  * @param google  { clientId, clientSecret } from oauth-client.json
  * @param paths   from appPaths()
+ * @param requireSql  false for commands that never connect to SQL Server (list, download, auth,
+ *                    check --skip-sql): SQL_PASSWORD may then be empty (restore-only machines).
  */
-export function envToConfig(vars, { google, paths, hostname } = {}) {
+export function envToConfig(vars, { google, paths, hostname, computerName, requireSql = true } = {}) {
   const get = (k) => (vars[k] ?? '').trim();
 
   const host = get('SQL_HOST') || 'localhost';
@@ -96,7 +111,9 @@ export function envToConfig(vars, { google, paths, hostname } = {}) {
   // fixed port (anything but the template's default 1433) bypasses the Browser.
   const instanceName = get('SQL_INSTANCE') && (get('SQL_PORT') === '' || port === 1433) ? get('SQL_INSTANCE') : undefined;
   req(get('SQL_USER'), 'SQL_USER is empty');
-  req((vars.SQL_PASSWORD ?? '') !== '', 'SQL_PASSWORD is empty');
+  req(!requireSql || (vars.SQL_PASSWORD ?? '') !== '',
+    'SQL_PASSWORD is empty (the installer fills it in when it creates the SQL login: run it again; '
+    + 'if SQL Server was prepared by hand with sql-prepare.sql, enter that password)');
   const databases = get('SQL_DATABASES').split(',').map((d) => d.trim()).filter(Boolean);
   req(databases.length, 'SQL_DATABASES is empty (comma-separated database names, e.g. Sales,HR)');
   req(new Set(databases).size === databases.length, 'SQL_DATABASES lists the same database twice');
@@ -142,9 +159,10 @@ export function envToConfig(vars, { google, paths, hostname } = {}) {
       port,
       instanceName,
       user: get('SQL_USER'),
-      password: vars.SQL_PASSWORD,
+      password: vars.SQL_PASSWORD ?? '',
       encrypt: flag(vars, 'SQL_ENCRYPT', true),
-      trustServerCertificate: flag(vars, 'SQL_TRUST_SERVER_CERTIFICATE', false),
+      // SQL Server's certificate is self-signed by default; for a connection to this machine that is fine.
+      trustServerCertificate: flag(vars, 'SQL_TRUST_SERVER_CERTIFICATE', isLocalSqlHost(host, { hostname, computerName })),
       databases,
       backupDir,
       localBackupDir: backupDir, // SQL Server runs on this machine
@@ -169,7 +187,7 @@ export function envToConfig(vars, { google, paths, hostname } = {}) {
 }
 
 /** Read the env file + OAuth client and return the normalized config. */
-export async function loadEnvConfig(paths, { hostname } = {}) {
+export async function loadEnvConfig(paths, { hostname, requireSql = true } = {}) {
   let text;
   try {
     text = await fs.readFile(paths.envFile, 'utf8');
@@ -178,5 +196,5 @@ export async function loadEnvConfig(paths, { hostname } = {}) {
   }
   const vars = parseEnvText(text, paths.envFile);
   const google = await loadOAuthClient(paths.oauthClientFile);
-  return envToConfig(vars, { google, paths, hostname });
+  return envToConfig(vars, { google, paths, hostname, requireSql });
 }

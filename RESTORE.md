@@ -99,7 +99,8 @@ After `REPLACE`, the database is in the state of the backup; anything written af
 
 1. On a Windows machine with SQL Server 2016 or newer **of the same or a newer version** as the client's, download
    `install.ps1` from the release and run it with **`-RestoreOnly`**, which installs without a scheduled task and
-   without a first backup:
+   without a first backup. It also leaves SQL Server alone (no login, no settings, no restart) and skips the SQL
+   checks: the program only downloads here, and you restore in SSMS yourself:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install.ps1 -RestoreOnly
    ```
@@ -107,7 +108,8 @@ After `REPLACE`, the database is in the state of the backup; anything written af
    - `BACKUP_ENCRYPTION_KEY`: the client's key from the password manager;
    - `GOOGLE_EMAIL`: the client's account;
    - `SERVER_NAME`: **leave empty** (the replacement machine's own name). Never set it to the client's server name.
-   - The `SQL_*` settings describe this machine's SQL Server so that `check` passes.
+   - The `SQL_*` settings: **leave them as in the template**, `SQL_PASSWORD` empty. They are not used or checked on
+     a restore-only machine (`check --skip-sql`).
 2. Sign in with the **client's** Google account when the installer asks (the client may need to approve it).
    `drive.file` access is tied to our OAuth client, not to a machine, so the client's backups are visible.
 3. Make sure the installer printed "Restore-only install". If you forgot `-RestoreOnly`, immediately run
