@@ -51,7 +51,7 @@ async function home() {
 
 const okSql = () => ({
   async connect() {}, async close() {}, async serverInfo() { return { major: 15, version: '15.0', edition: 'Express Edition' }; },
-  async assertDatabaseOnline() {}, async canBackup() { return true; },
+  async assertDatabaseOnline() {}, async canBackup() { return true; }, async canVerify() { return true; },
 });
 
 test('check reads the env file from BACKUP_MANAGER_HOME and exits 0 only when all pass', async () => {
@@ -116,4 +116,20 @@ test('auth logout works even when the env file is broken', async () => {
   assert.equal(await main(['auth', 'logout'], { stdout: c.stdout, env: h.env }), 1);
   assert.match(c.text, /revoking it at Google failed/);
   await assert.rejects(fs.access(path.join(h.dir, 'token.json')));
+});
+
+test('check --skip-sql works without SQL_PASSWORD (restore-only machine); a normal check still needs it', async () => {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const h = await home();
+  await fs.writeFile(path.join(h.dir, 'backup-manager.env'),
+    `SQL_USER=u\r\nSQL_PASSWORD=\r\nSQL_DATABASES=Sales\r\nSQL_BACKUP_DIR=C:\\nowhere\r\nBACKUP_ENCRYPTION_KEY=${Buffer.alloc(32, 1).toString('base64')}\r\n`);
+  const noSql = () => assert.fail('must not connect');
+  let c = capture();
+  assert.equal(await main(['check', '--skip-auth', '--skip-sql'], { stdout: c.stdout, env: h.env, createSqlClient: noSql }), 0, c.text);
+  assert.match(c.text, /\[ -- \] SQL connection: skipped/);
+
+  c = capture();
+  assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 1);
+  assert.match(c.text, /SQL_PASSWORD is empty \(the installer creates the SQL login/);
 });

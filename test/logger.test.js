@@ -67,3 +67,15 @@ test('cleanupLogs deletes only backup logs older than 30 days', async () => {
   assert.deepEqual(fs.readdirSync(dir).sort(), ['backup-2020-01-01.txt', 'backup-2026-10-18.log', 'backup-2026-11-17.log', 'other.log']);
   assert.deepEqual(cleanupLogs(path.join(dir, 'missing')), []);
 });
+
+test('logged SQL errors include the preceding server messages, still redacted', () => {
+  const lines = [];
+  const log = createLogger({ stream: { write: (l) => lines.push(l) } });
+  const e262 = Object.assign(new Error("CREATE DATABASE permission denied in database 'master'. Bearer abc.def"), { number: 262 });
+  const err = Object.assign(new Error('VERIFY DATABASE is terminating abnormally.'), { number: 3013, precedingErrors: [e262] });
+  log.error('backup failed', { error: err });
+  const { error } = JSON.parse(lines[0]);
+  assert.match(error.message, /^Msg 262: CREATE DATABASE permission denied .* \| Msg 3013: VERIFY DATABASE/);
+  assert.match(error.message, /Bearer \[REDACTED\]/);
+  assert.doesNotMatch(error.message, /abc\.def/);
+});

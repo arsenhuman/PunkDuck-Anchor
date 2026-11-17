@@ -17,9 +17,37 @@ export const DB_EXISTS_SQL = 'SELECT state_desc FROM sys.databases WHERE name = 
 
 export const BACKUP_PERMISSION_SQL = "SELECT HAS_PERMS_BY_NAME(@db, 'DATABASE', 'BACKUP DATABASE') AS can_backup;";
 
+// RESTORE VERIFYONLY needs CREATE DATABASE permission in master (db_backupoperator is not enough).
+export const VERIFY_PERMISSION_SQL = "SELECT HAS_PERMS_BY_NAME('master', 'DATABASE', 'CREATE DATABASE') AS can_verify;";
+
 export const SERVER_INFO_SQL = `SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major,
   CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS version,
   CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition;`;
+
+/** The server messages of a SQL error, oldest first (mssql puts the earlier ones in err.precedingErrors). */
+function sqlErrorChain(err) {
+  const preceding = Array.isArray(err?.precedingErrors) ? err.precedingErrors : [];
+  return [...preceding, err].filter(Boolean);
+}
+
+/** Every SQL Server error number in the chain, e.g. [262, 3013]. */
+export function sqlErrorNumbers(err) {
+  return sqlErrorChain(err).map((e) => e.number).filter((n) => Number.isInteger(n));
+}
+
+/**
+ * One line with every server message, in order:
+ * "Msg 262: CREATE DATABASE permission denied in database 'master'. | Msg 3013: VERIFY DATABASE is terminating abnormally."
+ * Errors without a SQL number (network, settings) keep their plain message.
+ */
+export function formatSqlError(err) {
+  return sqlErrorChain(err)
+    .map((e) => {
+      const msg = String(e?.message ?? e);
+      return Number.isInteger(e?.number) ? `Msg ${e.number}: ${msg}` : msg;
+    })
+    .join(' | ');
+}
 
 /** SQL Server 2016 is major version 13. */
 export const MIN_SQL_MAJOR = 13;
@@ -77,6 +105,12 @@ export class MssqlClient {
   async canBackup(db) {
     const r = await this.pool.request().input('db', this.driver.NVarChar(128), db).query(BACKUP_PERMISSION_SQL);
     return r.recordset?.[0]?.can_backup === 1;
+  }
+
+  /** True if the login may run RESTORE VERIFYONLY (CREATE DATABASE in master). Once per server. */
+  async canVerify() {
+    const r = await this.pool.request().query(VERIFY_PERMISSION_SQL);
+    return r.recordset?.[0]?.can_verify === 1;
   }
 
   /** { major, version, edition } */

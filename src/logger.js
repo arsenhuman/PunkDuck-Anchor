@@ -3,6 +3,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { formatSqlError } from './mssql.js';
 
 const SECRET_KEY = /pass(word)?|secret|token|authorization|api[-_]?key|encryption[-_]?key|^key$/i;
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -10,7 +11,8 @@ const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 export function redact(value, depth = 0) {
   if (depth > 6 || value === null || typeof value !== 'object') return value;
   if (value instanceof Error) {
-    return { name: value.name, message: redactString(value.message), code: value.code };
+    // formatSqlError adds SQL Server's earlier messages (err.precedingErrors), e.g. the 262 behind a 3013.
+    return { name: value.name, message: redactString(formatSqlError(value)), code: value.code };
   }
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
   const out = {};

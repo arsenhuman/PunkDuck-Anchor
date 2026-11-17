@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ConfigError } from '../src/config.js';
-import { defaultServerName, envToConfig, loadEnvConfig, loadOAuthClient, parseEnvText } from '../src/envconfig.js';
+import { defaultServerName, envToConfig, isLocalSqlHost, loadEnvConfig, loadOAuthClient, parseEnvText } from '../src/envconfig.js';
 import { appHome, appPaths } from '../src/paths.js';
 import { tmpDir } from './helpers.js';
 
@@ -34,7 +34,7 @@ function paths(home = '/data') {
 function cfg(over = {}, opts = {}) {
   const vars = { ...parseEnvText(ENV_TEXT), ...over };
   for (const [k, v] of Object.entries(vars)) if (v === undefined) delete vars[k];
-  return envToConfig(vars, { google: GOOGLE, paths: paths(), hostname: 'SQL-BOX01', ...opts });
+  return envToConfig(vars, { google: GOOGLE, paths: paths(), hostname: 'SQL-BOX01', computerName: 'SQL-BOX01', ...opts });
 }
 
 test('maps the env file onto the normalized config', () => {
@@ -91,7 +91,7 @@ for (const [label, over, msg] of [
   ['duplicate databases', { SQL_DATABASES: 'A,A' }, /SQL_DATABASES lists the same database twice/],
   ['bad database name', { SQL_DATABASES: 'x]y' }, /SQL_DATABASES: invalid database name "x\]y"/],
   ['empty user', { SQL_USER: '' }, /^SQL_USER is empty/],
-  ['empty password', { SQL_PASSWORD: '' }, /^SQL_PASSWORD is empty/],
+  ['empty password', { SQL_PASSWORD: '' }, /^SQL_PASSWORD is empty \(the installer creates the SQL login/],
   ['missing backup dir', { SQL_BACKUP_DIR: undefined }, /^SQL_BACKUP_DIR is empty/],
   ['bad port', { SQL_PORT: '70000' }, /^SQL_PORT must be a TCP port/],
   ['non-numeric port', { SQL_PORT: 'abc' }, /^SQL_PORT must be a positive whole number/],
@@ -154,4 +154,27 @@ test('loadEnvConfig reads the env file and oauth-client.json', async () => {
   assert.equal(c.servers[0].name, 'h1');
   await fs.writeFile(oauth, JSON.stringify({ installed: {} }));
   await assert.rejects(loadOAuthClient(oauth), /installed\.client_id/);
+});
+
+test('isLocalSqlHost: loopback names and this computer\'s name, case-insensitive', () => {
+  const me = { hostname: 'sql-box01.corp.local', computerName: 'SQL-BOX01' };
+  for (const h of ['localhost', 'LOCALHOST', '127.0.0.1', '::1', '.', '(local)', '(LOCAL)', 'sql-box01', 'Sql-Box01.Corp.Local', ' localhost ']) {
+    assert.equal(isLocalSqlHost(h, me), true, h);
+  }
+  for (const h of ['sqlbox', '10.0.0.5', 'sql-box01.other', '', undefined]) assert.equal(isLocalSqlHost(h, me), false, String(h));
+});
+
+test('SQL_TRUST_SERVER_CERTIFICATE defaults to true for a local SQL Server, false for a remote one; explicit wins', () => {
+  assert.equal(cfg().servers[0].trustServerCertificate, true, 'localhost');
+  assert.equal(cfg({ SQL_HOST: 'sql-box01' }).servers[0].trustServerCertificate, true, 'computer name');
+  assert.equal(cfg({ SQL_HOST: 'sqlbox' }).servers[0].trustServerCertificate, false, 'remote');
+  assert.equal(cfg({ SQL_TRUST_SERVER_CERTIFICATE: 'false' }).servers[0].trustServerCertificate, false, 'explicit false on localhost');
+  assert.equal(cfg({ SQL_HOST: 'sqlbox', SQL_TRUST_SERVER_CERTIFICATE: 'true' }).servers[0].trustServerCertificate, true, 'explicit true on remote');
+  assert.equal(cfg().servers[0].encrypt, true, 'still encrypted');
+});
+
+test('requireSql: false lets SQL_PASSWORD be empty (restore-only machine), other SQL values are still validated', () => {
+  assert.equal(cfg({ SQL_PASSWORD: '' }, { requireSql: false }).servers[0].password, '');
+  assert.equal(cfg({ SQL_PASSWORD: undefined }, { requireSql: false }).servers[0].password, '');
+  assert.throws(() => cfg({ SQL_PORT: 'abc', SQL_PASSWORD: '' }, { requireSql: false }), /SQL_PORT/);
 });

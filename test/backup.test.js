@@ -146,3 +146,19 @@ test('corrupt upload (md5 mismatch) is deleted and reported', async () => {
   assert.match(results[0].error, /checksum mismatch/);
   assert.deepEqual(await listBackups({ config: s.config, drive: s.drive }), []);
 });
+
+test('a failed verify reports every SQL message (262 behind 3013) in the result', async () => {
+  const s = await setup({ servers: [{ name: 'prod', host: 'h', user: 'u', password: 'p', databases: ['Sales'], backupDir: (await tmpDir()) }] });
+  const createSqlClient = (server) => ({
+    ...s.createSqlClient(server),
+    async backup(db, serverPath) { await fs.writeFile(serverPath, 'x'); },
+    async verify() {
+      const e262 = Object.assign(new Error("CREATE DATABASE permission denied in database 'master'."), { number: 262 });
+      throw Object.assign(new Error('VERIFY DATABASE is terminating abnormally.'), { number: 3013, precedingErrors: [e262] });
+    },
+  });
+  const { results, failed } = await runBackups({ ...s, createSqlClient, logger: silentLogger });
+  assert.equal(failed, 1);
+  assert.equal(results[0].error,
+    "Msg 262: CREATE DATABASE permission denied in database 'master'. | Msg 3013: VERIFY DATABASE is terminating abnormally.");
+});

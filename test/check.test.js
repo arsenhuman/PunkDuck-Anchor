@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { explainSqlError, formatChecks, runChecks } from '../src/check.js';
+import { explainSqlError, formatChecks, runChecks, verifyGrantFix } from '../src/check.js';
 import { tmpDir } from './helpers.js';
 
 async function setup({ server = {}, ...over } = {}) {
@@ -20,7 +20,7 @@ async function setup({ server = {}, ...over } = {}) {
   };
 }
 
-function fakeSql({ connectError, info = { major: 16, version: '16.0.1000.6', edition: 'Express Edition (64-bit)' }, dbs = { Sales: 'ONLINE', HR: 'ONLINE' }, perms = { Sales: true, HR: true } } = {}) {
+function fakeSql({ connectError, info = { major: 16, version: '16.0.1000.6', edition: 'Express Edition (64-bit)' }, dbs = { Sales: 'ONLINE', HR: 'ONLINE' }, perms = { Sales: true, HR: true }, canVerify = true } = {}) {
   const calls = { closed: 0 };
   return {
     calls,
@@ -33,6 +33,7 @@ function fakeSql({ connectError, info = { major: 16, version: '16.0.1000.6', edi
         if (dbs[db] !== 'ONLINE') throw new Error(`database "${db}" is ${dbs[db]}, not ONLINE`);
       },
       async canBackup(db) { return perms[db]; },
+      async canVerify() { calls.verify = (calls.verify ?? 0) + 1; if (canVerify instanceof Error) throw canVerify; return canVerify; },
     }),
   };
 }
@@ -44,7 +45,8 @@ test('all checks pass on a healthy setup', async () => {
   const sql = fakeSql();
   const r = await runChecks({ loadConfig: async () => config, createSqlClient: sql.create, authStatus: signedIn });
   assert.equal(r.ok, true, formatChecks(r.checks));
-  assert.deepEqual(r.checks.map((c) => c.name), ['Settings', 'SQL connection', 'Database Sales', 'Database HR', 'Backup folder', 'Work folder', 'Google account', 'Healthchecks']);
+  assert.deepEqual(r.checks.map((c) => c.name), ['Settings', 'SQL connection', 'Verify permission', 'Database Sales', 'Database HR', 'Backup folder', 'Work folder', 'Google account', 'Healthchecks']);
+  assert.equal(sql.calls.verify, 1, 'verify permission is checked once per server, not per database');
   assert.match(formatChecks(r.checks), /\[ OK \] SQL connection: localhost:1433 \(Express Edition \(64-bit\) 16\.0\.1000\.6\)/);
   assert.match(formatChecks(r.checks), /signed in as Client@gmail.com/);
   assert.equal(sql.calls.closed, 1);
@@ -71,7 +73,7 @@ test('database problems: missing, offline, no BACKUP permission', async () => {
   const byName = Object.fromEntries(r.checks.map((c) => [c.name, c]));
   assert.equal(byName['Database Sales'].ok, true);
   assert.match(byName['Database HR'].detail, /no BACKUP DATABASE permission/);
-  assert.match(byName['Database HR'].fix, /db_backupoperator/);
+  assert.match(byName['Database HR'].fix, /USE \[HR\]; CREATE USER \[backup_user\] FOR LOGIN \[backup_user\]; ALTER ROLE db_backupoperator ADD MEMBER \[backup_user\];/);
   assert.match(byName['Database Gone'].detail, /does not exist/);
   assert.match(byName['Database Old'].detail, /OFFLINE/);
 });
@@ -84,6 +86,7 @@ test('SQL connection failure skips the database checks and explains the fix', as
   const text = formatChecks(r.checks);
   assert.match(text, /\[FAIL\] SQL connection: .*TCP\/IP is probably disabled/);
   assert.match(text, /SQL Server Configuration Manager/);
+  assert.match(text, /\[ -- \] Verify permission: skipped/);
   assert.match(text, /\[ -- \] Database Sales: skipped/);
 });
 
@@ -131,7 +134,61 @@ test('explainSqlError recognizes the SQL Express traps', () => {
   assert.match(login.problem, /refused the login for SQL_USER "bu"/);
   assert.match(login.fix, /SQL Server and Windows Authentication mode/);
   assert.match(e('Failed to connect to localhost:1433 in 15000ms', 'ETIMEOUT').problem, /TCP\/IP is probably disabled/);
-  assert.match(e('self-signed certificate in certificate chain', 'ESOCKET').fix, /SQL_TRUST_SERVER_CERTIFICATE=true/);
+  const cert = e('self-signed certificate in certificate chain', 'ESOCKET');
+  assert.match(cert.problem, /SQL Server uses a self-signed certificate by default/);
+  assert.doesNotMatch(`${cert.problem} ${login.fix}`, /Express/, 'texts must not claim the server is Express');
+  assert.match(cert.fix, /SQL_TRUST_SERVER_CERTIFICATE/);
   assert.match(e('getaddrinfo ENOTFOUND sqlbox', 'ESOCKET').problem, /SQL_HOST/);
   assert.match(e('something odd').problem, /SQL Server error: something odd/);
+});
+
+test('missing CREATE DATABASE in master fails "Verify permission" with the exact SQL', async () => {
+  const config = await setup();
+  const r = await runChecks({ loadConfig: async () => config, createSqlClient: fakeSql({ canVerify: false }).create, authStatus: signedIn });
+  assert.equal(r.ok, false);
+  const text = formatChecks(r.checks);
+  assert.match(text, /\[FAIL\] Verify permission: SQL_USER "backup_user" has no CREATE DATABASE permission in master/);
+  assert.match(text, /USE master; CREATE USER \[backup_user\] FOR LOGIN \[backup_user\]; GRANT CREATE DATABASE TO \[backup_user\];/);
+  assert.match(text, /sql-prepare\.sql/);
+  assert.match(text, /\[ OK \] Database Sales: ONLINE, BACKUP permission OK/, 'database checks still run');
+});
+
+test('the fix SQL escapes "]" in the login name like QUOTENAME', () => {
+  assert.match(verifyGrantFix('we]ird'), /CREATE USER \[we\]\]ird\] FOR LOGIN \[we\]\]ird\]/);
+});
+
+test('a SQL error after connecting is reported once, not as a connection failure', async () => {
+  const config = await setup();
+  const err = Object.assign(new Error('boom'), { number: 50000 });
+  const r = await runChecks({ loadConfig: async () => config, createSqlClient: fakeSql({ canVerify: err }).create, authStatus: signedIn });
+  const text = formatChecks(r.checks);
+  assert.equal(r.ok, false);
+  assert.match(text, /\[ OK \] SQL connection/);
+  assert.match(text, /\[FAIL\] SQL error: SQL Server error: Msg 50000: boom/);
+});
+
+test('explainSqlError: error 262 (as the outer error or behind 3013) explains the verify permission', () => {
+  const srv = { host: 'localhost', port: 1433, user: 'bu' };
+  const e262 = Object.assign(new Error("CREATE DATABASE permission denied in database 'master'."), { number: 262 });
+  const verify = Object.assign(new Error('VERIFY DATABASE is terminating abnormally.'), { number: 3013, precedingErrors: [e262] });
+  for (const err of [e262, verify]) {
+    const x = explainSqlError(err, srv);
+    assert.match(x.problem, /SQL_USER "bu" may not verify backups/);
+    assert.match(x.fix, /GRANT CREATE DATABASE TO \[bu\]/);
+  }
+  assert.match(explainSqlError(verify, srv).problem,
+    /Msg 262: CREATE DATABASE permission denied in database 'master'\. \| Msg 3013: VERIFY DATABASE is terminating abnormally\./);
+});
+
+test('--skip-sql (restore-only machine) never connects and skips the SQL rows', async () => {
+  const config = await setup({ server: { localBackupDir: '/definitely/not/here' } });
+  const r = await runChecks({
+    loadConfig: async () => config, createSqlClient: () => assert.fail('must not connect'), authStatus: signedIn, skipSql: true,
+  });
+  assert.equal(r.ok, true, formatChecks(r.checks));
+  const text = formatChecks(r.checks);
+  assert.match(text, /\[ -- \] SQL connection: skipped \(--skip-sql\)/);
+  assert.match(text, /\[ -- \] Backup folder: skipped \(--skip-sql\)/);
+  assert.match(text, /\[ OK \] Google account/);
+  assert.doesNotMatch(text, /Database Sales/);
 });
