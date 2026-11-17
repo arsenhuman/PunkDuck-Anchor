@@ -2,11 +2,13 @@
 // Only the refresh token (and metadata) is persisted, in a 0600 file (on Windows the
 // data folder is locked down with icacls by install.ps1).
 //
+// The sign-in page is opened in the default browser automatically; the URL is printed as well.
 // Remote fallback for machines without a usable browser: the technician opens the URL on
 // their own laptop, and pastes the final http://127.0.0.1:... address (or just the code)
 // into the console. A pasted URL must carry the right state; the code is always redeemed
 // with our PKCE verifier and loopback redirect_uri, so a code from another flow is useless.
 
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -70,6 +72,29 @@ export async function fetchAccountEmail(request) {
     params: { fields: 'user(emailAddress)' },
   });
   return res.data?.user?.emailAddress;
+}
+
+/** The command that opens `url` in the default browser, without a shell (the URL contains "&"). */
+export function browserCommand(url, platform = process.platform) {
+  if (platform === 'win32') return { cmd: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', url] };
+  if (platform === 'darwin') return { cmd: 'open', args: [url] };
+  return { cmd: 'xdg-open', args: [url] };
+}
+
+/**
+ * Best effort: open `url` in the default browser. Returns false if the launcher could not be
+ * started synchronously; a later failure (e.g. no xdg-open) is ignored, the URL is printed anyway.
+ */
+export function openBrowser(url, { platform = process.platform, spawnFn = spawn } = {}) {
+  const { cmd, args } = browserCommand(url, platform);
+  try {
+    const child = spawnFn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on?.('error', () => {});
+    child.unref?.();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function stateMatches(got, expected) {
@@ -199,12 +224,13 @@ export function startLoopbackServer({ expectedState, timeoutMs = LOGIN_TIMEOUT_M
 }
 
 /**
- * Interactive login. `prompt(url)` shows the consent URL to the user.
+ * Interactive login. `prompt(url, { browserOpened })` shows the consent URL to the user;
+ * `openBrowser(url)` (optional) opens it first and returns whether that was attempted.
  * With `input` (a readable stream, normally stdin) the user may also paste the redirect
  * address or code; whichever arrives first (loopback or paste) wins.
  * Returns the connected email address.
  */
-export async function login(google, { prompt, loginHint, input, onInvalidPaste, timeoutMs } = {}) {
+export async function login(google, { prompt, openBrowser: open, loginHint, input, onInvalidPaste, timeoutMs } = {}) {
   const state = crypto.randomBytes(24).toString('base64url');
   const loopback = await startLoopbackServer({ expectedState: state, timeoutMs });
   const { redirectUri } = loopback;
@@ -219,7 +245,8 @@ export async function login(google, { prompt, loginHint, input, onInvalidPaste, 
     code_challenge_method: CodeChallengeMethod.S256,
     login_hint: loginHint,
   });
-  prompt(url);
+  const browserOpened = open ? Boolean(open(url)) : false;
+  prompt(url, { browserOpened });
   const paste = input ? waitForPastedCode({ input, expectedState: state, onInvalid: onInvalidPaste }) : null;
   let code;
   try {

@@ -178,3 +178,19 @@ test('requireSql: false lets SQL_PASSWORD be empty (restore-only machine), other
   assert.equal(cfg({ SQL_PASSWORD: undefined }, { requireSql: false }).servers[0].password, '');
   assert.throws(() => cfg({ SQL_PORT: 'abc', SQL_PASSWORD: '' }, { requireSql: false }), /SQL_PORT/);
 });
+
+test('requireSql: false lets SQL_DATABASES and SQL_BACKUP_DIR be empty (restore-only machine)', () => {
+  const s = cfg({ SQL_PASSWORD: '', SQL_DATABASES: '', SQL_BACKUP_DIR: '' }, { requireSql: false }).servers[0];
+  assert.deepEqual(s.databases, []);
+  assert.equal(s.backupDir, '');
+  assert.throws(() => cfg({ SQL_DATABASES: '' }), /SQL_DATABASES is empty/);
+  assert.throws(() => cfg({ SQL_BACKUP_DIR: '' }), /SQL_BACKUP_DIR is empty \(the installer fills it in/);
+});
+
+test('the packaged env template has no client-specific SQL defaults', async () => {
+  const text = await fs.readFile(new URL('../packaging/backup-manager.env.template', import.meta.url), 'utf8');
+  const vars = parseEnvText(text);
+  assert.equal(vars.SQL_DATABASES, '');
+  assert.equal(vars.SQL_BACKUP_DIR, '');
+  assert.equal(vars.SQL_INSTANCE, '');
+});

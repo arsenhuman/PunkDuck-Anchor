@@ -19,7 +19,9 @@ export const USAGE = `Usage: backup-manager <command> [options]
 Commands:
   check [--skip-sql]                   Verify settings, SQL Server, backup folder and Google sign-in
                                        (--skip-sql: restore-only machine, no SQL Server checks)
-  auth login [--email you@gmail.com]   Connect a Google account (prints a sign-in URL)
+  auth login [--email you@gmail.com] [--no-browser]
+                                       Connect a Google account (opens the sign-in page in the
+                                       browser; --no-browser: only print the URL)
   auth status                          Show the connected Google account
   auth logout                          Revoke and delete the stored Google sign-in
   backup [--db D]                      Back up the configured databases now
@@ -42,6 +44,7 @@ const OPTIONS = {
   db: { type: 'string' },
   out: { type: 'string', default: '.' },
   email: { type: 'string' },
+  'no-browser': { type: 'boolean', default: false }, // auth login: print the URL, don't open a browser
   json: { type: 'boolean', default: false },
   force: { type: 'boolean', default: false },
   'skip-auth': { type: 'boolean', default: false }, // check: used by install.ps1 before the first sign-in
@@ -52,9 +55,17 @@ const OPTIONS = {
 const COMMANDS = ['check', 'auth', 'backup', 'list', 'download', 'keygen'];
 
 const LOGIN_HELP = `
-No browser on this machine? Open the URL on your own computer and approve access.
+No browser on this machine (or it did not open)? Open the URL on your own computer and approve access.
 Your browser then fails to load a page at http://127.0.0.1:... - that is expected.
 Copy that full address from the address bar, paste it here and press Enter.`;
+
+function loginPrompt(url, { browserOpened, wanted }) {
+  const as = wanted ? ` as ${wanted}` : '';
+  const head = browserOpened
+    ? `Opening the Google sign-in page in your browser. Sign in${as} and approve access.\nIf no browser window appears, open this URL:`
+    : `Open this URL in a browser and approve access${as}:`;
+  return `${head}\n\n  ${url}\n${LOGIN_HELP}\n\nWaiting for authorization...`;
+}
 
 /** Exit code 1 when the local token was removed but revoking it at Google failed. */
 async function logoutCommand(google, out) {
@@ -83,6 +94,7 @@ export async function main(argv, {
   env = process.env,
   createSqlClient = (s) => new MssqlClient(s),
   authStatus = auth.status,
+  openBrowser = auth.openBrowser,
 } = {}) {
   let parsed;
   try {
@@ -150,14 +162,14 @@ export async function main(argv, {
   }
 
   try {
-    return await dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient });
+    return await dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient, openBrowser });
   } catch (err) {
     logger.error(`${cmd} failed`, { error: err });
     throw err;
   }
 }
 
-async function dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient }) {
+async function dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient, openBrowser }) {
   switch (cmd) {
     case 'auth': {
       if (sub === 'login') {
@@ -165,7 +177,8 @@ async function dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, cr
         const email = await auth.login(config.google, {
           loginHint: wanted,
           input: stdin,
-          prompt: (url) => out(`Open this URL in a browser and approve access${wanted ? ` as ${wanted}` : ''}:\n\n  ${url}\n${LOGIN_HELP}\n\nWaiting for authorization...`),
+          openBrowser: opts['no-browser'] ? undefined : openBrowser,
+          prompt: (url, { browserOpened } = {}) => out(loginPrompt(url, { browserOpened, wanted })),
           onInvalidPaste: (err) => out(`That did not work (${err.message}). Paste the full http://127.0.0.1:... address and press Enter.`),
         });
         out(`Connected Google account: ${email}`);
