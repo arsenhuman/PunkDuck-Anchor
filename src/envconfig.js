@@ -99,7 +99,8 @@ function flag(vars, key, dflt) {
  * @param google  { clientId, clientSecret } from oauth-client.json
  * @param paths   from appPaths()
  * @param requireSql  false for commands that never connect to SQL Server (list, download, auth,
- *                    check --skip-sql): SQL_PASSWORD may then be empty (restore-only machines).
+ *                    check --skip-sql): SQL_PASSWORD, SQL_DATABASES and SQL_BACKUP_DIR may then be
+ *                    empty (restore-only machines).
  */
 export function envToConfig(vars, { google, paths, hostname, computerName, requireSql = true } = {}) {
   const get = (k) => (vars[k] ?? '').trim();
@@ -115,11 +116,12 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
     'SQL_PASSWORD is empty (the installer fills it in when it creates the SQL login: run it again; '
     + 'if SQL Server was prepared by hand with sql-prepare.sql, enter that password)');
   const databases = get('SQL_DATABASES').split(',').map((d) => d.trim()).filter(Boolean);
-  req(databases.length, 'SQL_DATABASES is empty (comma-separated database names, e.g. Sales,HR)');
+  req(!requireSql || databases.length, 'SQL_DATABASES is empty (comma-separated database names, exactly as shown in SSMS)');
   req(new Set(databases).size === databases.length, 'SQL_DATABASES lists the same database twice');
   for (const db of databases) req(!/[\x00-\x1f\][]/.test(db) && db.length <= 128, `SQL_DATABASES: invalid database name "${db}"`);
   const backupDir = get('SQL_BACKUP_DIR');
-  req(backupDir, 'SQL_BACKUP_DIR is empty (the folder SQL Server writes backups to)');
+  req(!requireSql || backupDir, 'SQL_BACKUP_DIR is empty (the installer fills it in from SQL Server; '
+    + 'otherwise SSMS > server Properties > Database Settings > Backup)');
 
   const serverName = get('SERVER_NAME') || defaultServerName(hostname);
   req(/^[A-Za-z0-9._-]{1,64}$/.test(serverName), `SERVER_NAME may only contain letters, digits, ".", "_" and "-" (max 64), got "${serverName}"`);
@@ -174,7 +176,7 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
     workDir: paths.workDir,
     monitoring: { heartbeatUrl: heartbeatUrl || undefined },
   };
-  const config = normalizeConfig(raw, { env: { BACKUP_ENCRYPTION_KEY: key.toString('base64') }, resolveRefs: false });
+  const config = normalizeConfig(raw, { env: { BACKUP_ENCRYPTION_KEY: key.toString('base64') }, resolveRefs: false, requireSql });
   return {
     ...config,
     googleEmail: googleEmail || undefined,

@@ -87,7 +87,9 @@ A release is public and immediately becomes "latest", which is what `irm ... | i
 a Windows VM first; to fix a bad release, publish the next patch version.
 
 `.github/workflows/ci.yml` runs `npm ci` + `npm test` on `windows-latest` and `ubuntu-latest` for every push and
-pull request, and makes Windows PowerShell 5.1 parse the `.ps1` scripts.
+pull request. On Windows it also makes Windows PowerShell 5.1 parse the `.ps1` scripts (and checks they are pure
+ASCII), and runs `test/install-functions.ps1`: the pure functions of `install.ps1` and the rule that its T-SQL is
+constant text.
 
 ### Healthchecks.io (per client)
 
@@ -216,10 +218,16 @@ names the account it used. Then:
 2. Put the password into `SQL_PASSWORD` in the env file.
 3. Run the installer again with **`-SkipSqlSetup`**.
 
-**`SQL_BACKUP_DIR`** is still yours to fill in: SSMS > server Properties > Database Settings > *Backup*. Default:
+**`SQL_BACKUP_DIR`**: leave it empty and the installer fills it in with the instance's default backup folder
+(`SERVERPROPERTY('InstanceDefaultBackupPath')`). With `-SkipSqlSetup` or SQL Server prepared by hand you fill it in
+yourself: SSMS > server Properties > Database Settings > *Backup*, usually
 `C:\Program Files\Microsoft SQL Server\MSSQL<nn>.<INSTANCE>\MSSQL\Backup`, where `<nn>` is 13 for SQL Server
-2016, 14 for 2017, 15 for 2019, 16 for 2022 and 17 for 2025, and `<INSTANCE>` is e.g. `SQLEXPRESS` (or
-`MSSQLSERVER` for a default instance).
+2016, 14 for 2017, 15 for 2019, 16 for 2022 and 17 for 2025, and `<INSTANCE>` is the instance name (`MSSQLSERVER`
+for a default instance).
+
+**`SQL_DATABASES` and `SQL_INSTANCE`** have no defaults: every client names them differently. When Notepad opens,
+the installer prints the SQL Server instances it finds on the machine, and if a database name is wrong it lists the
+databases that do exist on that instance.
 
 Common SQL Server traps, all detected by `backup-manager check`:
 
@@ -242,15 +250,17 @@ The env file is the **only** supported configuration. Format: `KEY=VALUE`, `#` s
 # ---- SQL Server ----
 SQL_HOST=localhost
 SQL_PORT=1433
-# For a named instance such as SQLEXPRESS (needs the SQL Browser service, or set SQL_PORT instead):
+# Instance name: the part after "MSSQL$" in the SQL Server service name (e.g. SQLEXPRESS, or the client's own name).
+# Leave empty for the default instance (service "MSSQLSERVER"). A named instance needs the SQL Browser service,
+# or set SQL_PORT to its fixed port instead.
 SQL_INSTANCE=
 SQL_USER=backup_user
 # Leave empty: the installer creates the login and fills this in
 SQL_PASSWORD=
-# Comma-separated
-SQL_DATABASES=Sales,HR
-# Folder SQL Server writes backups to (must be readable by this program)
-SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.SQLEXPRESS\MSSQL\Backup
+# REQUIRED: the client's databases, comma-separated, exactly as shown in SSMS (e.g. Db1,Db2)
+SQL_DATABASES=
+# Folder SQL Server writes backups to. Leave empty: the installer asks SQL Server for its default backup folder
+SQL_BACKUP_DIR=
 
 # ---- Naming on Google Drive (default: computer name) ----
 SERVER_NAME=
@@ -274,10 +284,10 @@ BACKUP_ENCRYPTION_KEY=
 | --- | --- | --- |
 | `SQL_HOST` | `localhost` | SQL Server host. It must run on this machine (the program reads the `.bak` from `SQL_BACKUP_DIR`) |
 | `SQL_PORT` | `1433` | TCP port. With `SQL_INSTANCE` set, a value other than 1433 means "connect to this port directly, skip SQL Browser" |
-| `SQL_INSTANCE` | (none) | Named instance, e.g. `SQLEXPRESS`. Found through the SQL Browser service |
+| `SQL_INSTANCE` | (none) | Named instance: the part after `MSSQL$` in the service name, e.g. `SQLEXPRESS`. Empty for the default instance (`MSSQLSERVER`). Found through the SQL Browser service |
 | `SQL_USER`, `SQL_PASSWORD` | `backup_user` / filled in by the installer | SQL login. Leave `SQL_PASSWORD` empty and the installer creates the login and writes the password here. A restore-only machine doesn't need it |
-| `SQL_DATABASES` | required | Comma-separated database names |
-| `SQL_BACKUP_DIR` | required | Folder SQL Server writes backups to |
+| `SQL_DATABASES` | required | Comma-separated database names, as shown in SSMS. A restore-only machine doesn't need it |
+| `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to. A restore-only machine doesn't need it |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
 | `GOOGLE_EMAIL` | (none) | Expected Google account; used as the sign-in hint, and `check` fails if a different account is signed in |
 | `BACKUP_TIME` | `02:00` | Daily start time (24-hour `HH:MM`), used by the installer for the scheduled task. Re-run the installer after changing it |
@@ -296,11 +306,12 @@ Rules:
 
 ## Google sign-in
 
-`backup-manager auth login` (run by the installer) prints a Google sign-in URL.
+`backup-manager auth login` (run by the installer) **opens the Google sign-in page in the default browser** and also
+prints the URL. Add `--no-browser` to only print it.
 
-- **With a browser on the machine:** open the URL, sign in with the client's account and approve. Google redirects to a
-  temporary `http://127.0.0.1:<port>` listener and the program finishes by itself.
-- **Without a usable browser** (the usual case over RDP): open the URL on **your own laptop**, sign in with the
+- **With a browser on the machine:** sign in with the client's account in the window that opens and approve. Google
+  redirects to a temporary `http://127.0.0.1:<port>` listener and the program finishes by itself.
+- **Without a usable browser** (no browser window appears): open the printed URL on **your own laptop**, sign in with the
   client's account and approve. The browser then tries to open `http://127.0.0.1:...` and **fails to load; that is
   expected**. Copy that full address from the address bar and paste it into the RDP console, then press Enter.
   Pasting only the `code` value also works.

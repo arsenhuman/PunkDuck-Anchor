@@ -50,7 +50,8 @@ function bool(value, name, dflt) {
 }
 
 /** Validate and apply defaults. Returns a new, normalized config object. */
-export function normalizeConfig(raw, { env = process.env, resolveRefs = true } = {}) {
+/** requireSql: false lets databases and backupDir be empty (restore-only machine, see envconfig.js). */
+export function normalizeConfig(raw, { env = process.env, resolveRefs = true, requireSql = true } = {}) {
   req(raw && typeof raw === 'object' && !Array.isArray(raw), 'config must be a JSON object');
   const c = resolveRefs ? resolveEnvRefs(raw, env) : raw;
 
@@ -81,12 +82,12 @@ export function normalizeConfig(raw, { env = process.env, resolveRefs = true } =
     req(typeof s.host === 'string' && s.host, `${w}.host is required`);
     req(typeof s.user === 'string' && s.user, `${w}.user is required`);
     req(typeof s.password === 'string', `${w}.password is required (use "env:VAR")`);
-    req(Array.isArray(s.databases) && s.databases.length > 0, `${w}.databases must be a non-empty array`);
+    req(Array.isArray(s.databases) && (s.databases.length > 0 || !requireSql), `${w}.databases must be a non-empty array`);
     for (const db of s.databases) {
       req(typeof db === 'string' && DB_NAME_RE.test(db), `${w}.databases: invalid database name ${JSON.stringify(db)}`);
     }
     req(new Set(s.databases).size === s.databases.length, `${w}.databases contains duplicates`);
-    req(typeof s.backupDir === 'string' && s.backupDir, `${w}.backupDir is required (path as SQL Server sees it)`);
+    req(typeof s.backupDir === 'string' && (s.backupDir || !requireSql), `${w}.backupDir is required (path as SQL Server sees it)`);
     const port = s.port ?? 1433;
     req(isPosInt(port) && port < 65536, `${w}.port must be a valid TCP port`);
     const requestTimeoutMs = s.requestTimeoutMs ?? 6 * 60 * 60 * 1000;
@@ -102,7 +103,7 @@ export function normalizeConfig(raw, { env = process.env, resolveRefs = true } =
       trustServerCertificate: bool(s.trustServerCertificate, `${w}.trustServerCertificate`, false),
       databases: [...s.databases],
       backupDir: s.backupDir,
-      localBackupDir: path.resolve(expandHome(s.localBackupDir || s.backupDir)),
+      localBackupDir: s.localBackupDir || s.backupDir ? path.resolve(expandHome(s.localBackupDir || s.backupDir)) : '',
       nativeCompression: bool(s.nativeCompression, `${w}.nativeCompression`, false),
       requestTimeoutMs,
     };
