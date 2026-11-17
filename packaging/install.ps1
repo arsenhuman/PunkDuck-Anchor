@@ -71,13 +71,26 @@ function Invoke-App {
 function Get-EnvValue([string]$Path, [string]$Key) {
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
         if ($line -match "^\s*$Key\s*=(.*)$") {
-            return $Matches[1].Trim().Trim("'").Trim('"')
+            $v = $Matches[1].Trim()
+            if ($v.Length -ge 2 -and "'`"``".Contains([string]$v[0]) -and $v[-1] -eq $v[0]) { return $v.Substring(1, $v.Length - 2) }
+            return $v.Trim("'").Trim('"')
         }
     }
     return ''
 }
 
+# How a value is written to the env file so that src/envconfig.js reads it back unchanged:
+# unquoted unless it has "#" (refused unquoted), a leading quote or outer spaces; then in single
+# quotes, or backticks if it contains a single quote. Never double quotes: they turn \n into a newline.
+function Format-EnvValue([string]$Value) {
+    if ($Value -notmatch '#' -and $Value -notmatch '^[''"`]' -and $Value -eq $Value.Trim()) { return $Value }
+    if (-not $Value.Contains("'")) { return "'$Value'" }
+    if (-not $Value.Contains('`')) { return "``$Value``" }
+    throw "This value contains both ' and `` and cannot be written to the settings file: $Value"
+}
+
 function Set-EnvValue([string]$Path, [string]$Key, [string]$Value) {
+    $Value = Format-EnvValue $Value
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.AddRange([IO.File]::ReadAllLines($Path))
     $found = $false
@@ -90,6 +103,21 @@ function Set-EnvValue([string]$Path, [string]$Key, [string]$Value) {
     }
     if (-not $found) { $lines.Add("$Key=$Value") }
     [IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# SQL_INSTANCE values of the SQL Server instances on this machine: '' is the default instance.
+function Get-SqlInstanceNames {
+    @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { ConvertTo-SqlInstanceName $_.Name })
+}
+
+function ConvertTo-SqlInstanceName([string]$ServiceName) {
+    if ($ServiceName -eq 'MSSQLSERVER') { return '' }
+    return $ServiceName.Substring(6)
+}
+
+function Format-SqlInstanceNames([string[]]$Names) {
+    if ($null -eq $Names -or $Names.Count -eq 0) { return 'none' }
+    ($Names | ForEach-Object { if ($_) { $_ } else { '(empty) = default instance' } }) -join ', '
 }
 
 # Only SYSTEM and BUILTIN\Administrators get access (SIDs, so it works on any Windows language).
@@ -186,11 +214,14 @@ function Initialize-EnvFile {
     Write-Host 'Fill in the settings in Notepad, save (Ctrl+S) and close Notepad.' -ForegroundColor Yellow
     if (-not $RestoreOnly) {
         Write-Host 'Required: SQL_DATABASES (the client''s databases as shown in SSMS) and SQL_INSTANCE for a named instance.' -ForegroundColor Yellow
-        Write-Host 'Leave SQL_BACKUP_DIR empty: the installer reads the backup folder from SQL Server.' -ForegroundColor Yellow
-        $services = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-        if ($services.Count) {
-            $names = $services | ForEach-Object { if ($_ -eq 'MSSQLSERVER') { '(empty) = default instance' } else { $_.Substring(6) } }
-            Write-Host "SQL Server instances on this machine (SQL_INSTANCE): $($names -join ', ')" -ForegroundColor Yellow
+        if ($SkipSqlSetup) {
+            Write-Host 'Required with -SkipSqlSetup: SQL_BACKUP_DIR, the folder SQL Server writes backups to (SSMS > server Properties > Database Settings > Backup).' -ForegroundColor Yellow
+        } else {
+            Write-Host 'Leave SQL_BACKUP_DIR empty: the installer reads the backup folder from SQL Server on this machine.' -ForegroundColor Yellow
+        }
+        $instances = @(Get-SqlInstanceNames)
+        if ($instances.Count) {
+            Write-Host "SQL Server instances on this machine (SQL_INSTANCE): $(Format-SqlInstanceNames $instances)" -ForegroundColor Yellow
         }
     }
     Write-Host 'Leave BACKUP_ENCRYPTION_KEY empty: a key is generated in the next step.' -ForegroundColor Yellow
@@ -546,6 +577,9 @@ function Initialize-SqlServer {
     if (-not $sqlHost) { $sqlHost = 'localhost' }
     if (-not (Test-LocalSqlHost $sqlHost)) {
         Write-Host "SQL_HOST=$sqlHost is not this machine: skipping SQL Server preparation."
+        if (-not (Get-EnvValue $EnvFile 'SQL_BACKUP_DIR')) {
+            Write-Host "SQL_BACKUP_DIR is not filled in automatically then: set it in $EnvFile." -ForegroundColor Yellow
+        }
         return
     }
     $inst = Resolve-SqlInstance (Get-EnvValue $EnvFile 'SQL_INSTANCE') (Get-EnvValue $EnvFile 'SQL_PORT')
@@ -560,9 +594,8 @@ function Initialize-SqlServer {
     # 1. The service
     $svc = Get-Service -Name $inst.ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) {
-        $found = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-        $list = if ($found.Count) { $found -join ', ' } else { 'none' }
-        throw "SQL Server service $($inst.ServiceName) not found (installed: $list). Fix SQL_INSTANCE in $EnvFile (empty for MSSQLSERVER, otherwise the part after MSSQL`$)."
+        $list = Format-SqlInstanceNames @(Get-SqlInstanceNames)
+        throw "SQL Server service $($inst.ServiceName) not found (SQL_INSTANCE values on this machine: $list). Fix SQL_INSTANCE in $EnvFile."
     }
     if ($svc.Status -ne 'Running') {
         Write-Host "Starting $($inst.ServiceName) ..."

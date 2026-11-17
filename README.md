@@ -287,7 +287,7 @@ BACKUP_ENCRYPTION_KEY=
 | `SQL_INSTANCE` | (none) | Named instance: the part after `MSSQL$` in the service name, e.g. `SQLEXPRESS`. Empty for the default instance (`MSSQLSERVER`). Found through the SQL Browser service |
 | `SQL_USER`, `SQL_PASSWORD` | `backup_user` / filled in by the installer | SQL login. Leave `SQL_PASSWORD` empty and the installer creates the login and writes the password here. A restore-only machine doesn't need it |
 | `SQL_DATABASES` | required | Comma-separated database names, as shown in SSMS. A restore-only machine doesn't need it |
-| `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to. A restore-only machine doesn't need it |
+| `SQL_BACKUP_DIR` | filled in by the installer (not with `-SkipSqlSetup`) | Folder SQL Server writes backups to. A restore-only machine doesn't need it |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
 | `GOOGLE_EMAIL` | (none) | Expected Google account; used as the sign-in hint, and `check` fails if a different account is signed in |
 | `BACKUP_TIME` | `02:00` | Daily start time (24-hour `HH:MM`), used by the installer for the scheduled task. Re-run the installer after changing it |
