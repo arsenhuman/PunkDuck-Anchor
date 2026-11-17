@@ -112,7 +112,8 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
   const instanceName = get('SQL_INSTANCE') && (get('SQL_PORT') === '' || port === 1433) ? get('SQL_INSTANCE') : undefined;
   req(get('SQL_USER'), 'SQL_USER is empty');
   req(!requireSql || (vars.SQL_PASSWORD ?? '') !== '',
-    'SQL_PASSWORD is empty (the installer creates the SQL login and fills it in: run the installer again)');
+    'SQL_PASSWORD is empty (the installer fills it in when it creates the SQL login: run it again; '
+    + 'if SQL Server was prepared by hand with sql-prepare.sql, enter that password)');
   const databases = get('SQL_DATABASES').split(',').map((d) => d.trim()).filter(Boolean);
   req(databases.length, 'SQL_DATABASES is empty (comma-separated database names, e.g. Sales,HR)');
   req(new Set(databases).size === databases.length, 'SQL_DATABASES lists the same database twice');

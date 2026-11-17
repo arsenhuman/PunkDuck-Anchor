@@ -91,7 +91,7 @@ for (const [label, over, msg] of [
   ['duplicate databases', { SQL_DATABASES: 'A,A' }, /SQL_DATABASES lists the same database twice/],
   ['bad database name', { SQL_DATABASES: 'x]y' }, /SQL_DATABASES: invalid database name "x\]y"/],
   ['empty user', { SQL_USER: '' }, /^SQL_USER is empty/],
-  ['empty password', { SQL_PASSWORD: '' }, /^SQL_PASSWORD is empty \(the installer creates the SQL login/],
+  ['empty password', { SQL_PASSWORD: '' }, /^SQL_PASSWORD is empty \(the installer fills it in when it creates the SQL login/],
   ['missing backup dir', { SQL_BACKUP_DIR: undefined }, /^SQL_BACKUP_DIR is empty/],
   ['bad port', { SQL_PORT: '70000' }, /^SQL_PORT must be a TCP port/],
   ['non-numeric port', { SQL_PORT: 'abc' }, /^SQL_PORT must be a positive whole number/],

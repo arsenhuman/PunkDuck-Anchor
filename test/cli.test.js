@@ -131,5 +131,5 @@ test('check --skip-sql works without SQL_PASSWORD (restore-only machine); a norm
 
   c = capture();
   assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 1);
-  assert.match(c.text, /SQL_PASSWORD is empty \(the installer creates the SQL login/);
+  assert.match(c.text, /SQL_PASSWORD is empty \(the installer fills it in when it creates the SQL login/);
 });
