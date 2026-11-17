@@ -74,9 +74,15 @@ export async function fetchAccountEmail(request) {
   return res.data?.user?.emailAddress;
 }
 
-/** The command that opens `url` in the default browser, without a shell (the URL contains "&"). */
+/**
+ * The command that opens `url` in the default browser, without a shell (the URL contains "&").
+ * Windows: explorer.exe hands the URL to the running desktop shell, so the browser starts with
+ * the technician's normal rights even when this program runs elevated (install.ps1 must).
+ * rundll32 would start it from this process, with the Administrator token. Explorer splits its
+ * command line at commas; the sign-in URL has none (query values are percent-encoded).
+ */
 export function browserCommand(url, platform = process.platform) {
-  if (platform === 'win32') return { cmd: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', url] };
+  if (platform === 'win32') return { cmd: 'explorer.exe', args: [url] };
   if (platform === 'darwin') return { cmd: 'open', args: [url] };
   return { cmd: 'xdg-open', args: [url] };
 }
