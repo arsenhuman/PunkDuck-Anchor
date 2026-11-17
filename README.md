@@ -311,7 +311,7 @@ The template, with instructions for the technician, is
 | `SQL_INSTANCE` | (none) | Named instance: the part after `MSSQL$` in the service name, e.g. `SQLEXPRESS`. Empty for the default instance (`MSSQLSERVER`). Found through the SQL Browser service |
 | `SQL_USER`, `SQL_PASSWORD` | filled in by the installer | SQL login. Leave both empty and the installer creates `backup_user` and writes both here; or enter an existing login and its password to use that one (see *SQL Server preparation*). A restore-only machine doesn't need them |
 | `SQL_DATABASES` | required | Comma-separated database names, as shown in SSMS. A restore-only machine doesn't need it |
-| `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to, as SQL Server sees it. A restore-only machine doesn't need it |
+| `SQL_BACKUP_DIR` | filled in by the installer (not with `-SkipSqlSetup` or a remote `SQL_HOST`) | Folder SQL Server writes backups to, as SQL Server sees it. A restore-only machine doesn't need it |
 | `SQL_LOCAL_BACKUP_DIR` | `SQL_BACKUP_DIR` | Only for a remote `SQL_HOST`, and required then: the same folder as a network share seen from this machine, e.g. `\\sqlhost\Backup` |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
 | `GOOGLE_EMAIL` | (none) | Expected Google account; used as the sign-in hint, and `check` fails if a different account is signed in |

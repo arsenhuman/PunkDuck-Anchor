@@ -128,6 +128,34 @@ $p = Get-TcpPortPlan '1500' '1433'
 Assert-Equal 'adopt' $p.Action 'other static port: adopt'
 Assert-Equal '1500' $p.Port 'adopt the configured port'
 
+# ---- Format-EnvValue / Set-EnvValue / Get-EnvValue ----
+Assert-Equal 'C:\SQL\Backup' (Format-EnvValue 'C:\SQL\Backup') 'plain value stays unquoted'
+Assert-Equal "'D:\SQL#Backups'" (Format-EnvValue 'D:\SQL#Backups') '"#" is single-quoted (envconfig.js refuses it unquoted)'
+Assert-Equal "``D:\it's#x``" (Format-EnvValue "D:\it's#x") 'a value with a single quote goes in backticks'
+Assert-Equal "' x'" (Format-EnvValue ' x') 'outer spaces are kept by quoting'
+$threw = $false
+try { Format-EnvValue "a'b``#" | Out-Null } catch { $threw = $true }
+Assert-True $threw "a value with both ' and a backtick is refused"
+
+$envTmp = [IO.Path]::GetTempFileName()
+try {
+    [IO.File]::WriteAllLines($envTmp, @('SQL_HOST=localhost', 'SQL_BACKUP_DIR='))
+    foreach ($v in @('D:\SQL#Backups', 'C:\Program Files\Backup', "D:\it's#x", 'plain')) {
+        Set-EnvValue $envTmp 'SQL_BACKUP_DIR' $v
+        Assert-Equal $v (Get-EnvValue $envTmp 'SQL_BACKUP_DIR') "Set-EnvValue then Get-EnvValue round-trips '$v'"
+    }
+    Assert-Equal 'localhost' (Get-EnvValue $envTmp 'SQL_HOST') 'other keys are untouched'
+} finally {
+    Remove-Item -LiteralPath $envTmp -ErrorAction SilentlyContinue
+}
+
+# ---- ConvertTo-SqlInstanceName / Format-SqlInstanceNames ----
+Assert-Equal '' (ConvertTo-SqlInstanceName 'MSSQLSERVER') 'default instance is the empty SQL_INSTANCE'
+Assert-Equal 'SQLEXPRESS' (ConvertTo-SqlInstanceName 'MSSQL$SQLEXPRESS') 'named instance is the part after MSSQL$'
+Assert-Equal '(empty) = default instance, SQLEXPRESS' (Format-SqlInstanceNames @('', 'SQLEXPRESS')) 'instance list shows the SQL_INSTANCE values'
+Assert-Equal 'none' (Format-SqlInstanceNames @()) 'no instances'
+Assert-Equal '(empty) = default instance' (Format-SqlInstanceNames @('')) 'only the default instance is not "none"'
+
 # ---- Security invariant: T-SQL is constant text, values only as parameters ----
 # Every -Sql argument of Invoke-SqlAdmin is a $Sql* variable, and every $Sql* variable is assigned
 # exactly once, at the top level, from a single-quoted string (no interpolation, no concatenation).

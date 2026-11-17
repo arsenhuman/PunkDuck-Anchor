@@ -126,8 +126,8 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
   req(new Set(databases).size === databases.length, 'SQL_DATABASES lists the same database twice');
   for (const db of databases) req(!/[\x00-\x1f\][]/.test(db) && db.length <= 128, `SQL_DATABASES: invalid database name "${db}"`);
   const backupDir = get('SQL_BACKUP_DIR');
-  req(!requireSql || backupDir, 'SQL_BACKUP_DIR is empty (the installer fills it in from SQL Server; '
-    + 'otherwise SSMS > server Properties > Database Settings > Backup)');
+  req(!requireSql || backupDir, 'SQL_BACKUP_DIR is empty (set it to the folder SQL Server writes backups to: SSMS > server '
+    + 'Properties > Database Settings > Backup; the installer fills it in only when it prepares a local SQL Server)');
   const localBackupDir = get('SQL_LOCAL_BACKUP_DIR');
   const local = isLocalSqlHost(host, { hostname, computerName });
   req(!requireSql || local || localBackupDir,
