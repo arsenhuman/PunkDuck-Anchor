@@ -5,7 +5,8 @@ them, compressed and encrypted, to the **client's own Google Drive**.
 
 - **Target:** Windows 10/11 x64, SQL Server 2016 or newer (Express included). One SQL Server per machine.
 - **Delivery:** a self-contained release zip (bundled `node.exe`, nothing to install beforehand), installed by
-  **our team over RDP** with `install.ps1`.
+  **our team over RDP** with `install.ps1`. The installer also prepares SQL Server (login, permissions, mixed mode,
+  TCP/IP); the only decision it asks for is whether SQL Server may be restarted now.
 - **Scheduling:** Windows Task Scheduler, task **"PunkDuck Backup Manager"**, daily, as SYSTEM.
 - **Monitoring:** Healthchecks.io, one check per client.
 - **Restores:** always done by our team. See [RESTORE.md](RESTORE.md).
@@ -16,7 +17,8 @@ What one backup run does for each database:
 2. Runs `BACKUP DATABASE @db TO DISK = @path WITH CHECKSUM, COPY_ONLY, INIT, FORMAT`. The database name and path are
    passed as parameters and are never concatenated into the SQL. `COPY_ONLY` means the tool doesn't break the
    client's existing differential or log backup chain.
-3. Runs `RESTORE VERIFYONLY ... WITH CHECKSUM`.
+3. Runs `RESTORE VERIFYONLY ... WITH CHECKSUM`. SQL Server requires `CREATE DATABASE` permission in `master` for this,
+   so the login needs it besides `db_backupoperator`.
 4. Streams the `.bak` through gzip and AES-256-GCM encryption.
 5. Uploads the result with a chunked, **resumable** Drive upload to `MSSQL Backups/<SERVER_NAME>/<database>/`, and
    compares Drive's MD5 and size with the local file.
@@ -404,7 +406,7 @@ selectTargets(config, {server, db})            # which (server, db) pairs; error
        └─ per db: backupOne()
             1. sqlClient.assertDatabaseOnline(db)        SELECT state_desc FROM sys.databases WHERE name=@db
             2. sqlClient.backup(db, serverPath)          BACKUP DATABASE @db TO DISK=@path WITH CHECKSUM, COPY_ONLY, INIT, FORMAT, STATS=10 [, COMPRESSION]
-            3. sqlClient.verify(serverPath)              RESTORE VERIFYONLY FROM DISK=@path WITH CHECKSUM
+            3. sqlClient.verify(serverPath)              RESTORE VERIFYONLY FROM DISK=@path WITH CHECKSUM (needs CREATE DATABASE in master)
             4. fs.access(localBak)                       same file as seen by this process (localBackupDir)
             5. packFile(localBak → workDir/artifact)     gzip? → encrypt? → hash (sha256+md5); skipped if neither
             6. drive.ensurePath([rootFolder, server.name, db])
@@ -511,6 +513,9 @@ AAD        = the 13-byte header
 - **Exit codes:** `0` on success. `1` on a runtime error, when any database failed, when any `check` fails, or for `auth status` when not logged in. `2` on a usage error.
 - **Error types:** `ConfigError` (config problems) and `AuthError` (not logged in, OAuth failure). Other errors carry plain messages.
   Messages are written to be acted on and name the env key, for example "SQL_DATABASES is empty".
+- **SQL errors** are printed and logged with every server message in order (`formatSqlError`), e.g.
+  `Msg 262: CREATE DATABASE permission denied in database 'master'. | Msg 3013: VERIFY DATABASE is terminating abnormally.`
+  In `check`, a SQL error after a successful connection is shown as its own "SQL error" row.
 - **Logs:** JSON lines on **stderr** and in the daily log file. Command output (results, lists) goes to **stdout**, so `--json` output can be piped.
 
 ### Testing approach
@@ -591,5 +596,7 @@ and is not documented for clients.
 
 ## Known issues
 
-- The `.ps1` scripts can't be exercised in CI (they need Administrator, Task Scheduler and a real SQL Server);
-  CI only checks that Windows PowerShell 5.1 parses them. Test a new release on a Windows VM before rolling it out.
+- The `.ps1` scripts can't be run end to end in CI (they need Administrator, Task Scheduler and a real SQL Server).
+  CI checks that Windows PowerShell 5.1 parses them and tests the pure functions of `install.ps1`, but the SQL Server
+  preparation (SqlClient, WMI, service restart) is only tested by hand. Test a new release on a Windows VM with a
+  fresh SQL Server Express before rolling it out (checklist: `docs/sql-setup-plan.md`, section 8).
