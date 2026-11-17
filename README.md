@@ -48,17 +48,31 @@ Google account, and backups go to **their own** Drive. We have no access to any 
 The only scope is `drive.file`: the program sees only the files and folders it created.
 
 1. In <https://console.cloud.google.com/>, create a project and enable the **Google Drive API**.
-2. **OAuth consent screen:** *External*. Don't upload a logo (that triggers brand verification). `drive.file` is
-   non-sensitive, so no security review is needed.
-3. **Publish to production.** In *Testing* mode, sign-ins expire after 7 days.
-4. **Credentials > Create credentials > OAuth client ID**, application type **Desktop app**.
+2. **Google Auth Platform > Branding** (older menus: *OAuth consent screen*): audience *External*, app name
+   "PunkDuck Backup Manager", support and developer contact email. **Don't upload a logo**: that triggers brand
+   verification. Optionally declare the scope `.../auth/drive.file` under **Data access**.
+3. **Clients > Create client**, application type **Desktop app**. Keep the client ID and secret in the company
+   password manager.
+4. **Audience:** a new app is in *Testing* mode. Only users listed under **Test users** can sign in, and their
+   sign-ins expire after 7 days. That is fine for trying things out; add your test Gmail there.
+   **Before the first real client, click Publish app.** `drive.file` is a non-sensitive scope, so publishing needs no
+   Google review.
 5. Store the client ID and secret as GitHub repository secrets `GOOGLE_OAUTH_CLIENT_ID` and
-   `GOOGLE_OAUTH_CLIENT_SECRET`. The release build writes them into `oauth-client.json` inside the zip. The file is
-   never committed. A desktop client ID is not treated as confidential by Google, so the zip can be public.
+   `GOOGLE_OAUTH_CLIENT_SECRET` (`gh secret set GOOGLE_OAUTH_CLIENT_ID -R arsenhuman/PunkDuck-Anchor`, same for the
+   secret). The release build writes them into `oauth-client.json` inside the zip. The file is never committed.
+
+**Why the "secret" can ship in a public zip:** the client ID and secret only identify our *program* to Google. For a
+Desktop app, Google does not treat the secret as confidential, because any installed program can be taken apart.
+Access is protected by the client's own sign-in and approval, PKCE, and the per-machine refresh token in
+`token.json`, which is the real secret and never leaves the machine. Technicians and clients never handle the client
+ID or secret: they are inside the release.
 
 ### Releases
 
-1. Bump `version` in `package.json`, commit, then tag and push: `git tag v1.2.0 && git push origin v1.2.0`.
+Prerequisite: the two repository secrets above. Without them the build step fails and nothing is published.
+
+1. Bump `version` in `package.json`, commit, then tag and push: `git tag -a v1.2.0 -m v1.2.0 && git push origin v1.2.0`.
+   The tag must match `package.json` (`v` + version), or the workflow stops.
 2. `.github/workflows/release.yml` (Windows runner) runs the tests, checks that the tag matches `package.json`, runs
    `scripts/build-package.js` and creates a GitHub Release with:
    - `backup-manager-<version>-win-x64.zip`: `node.exe` (official Node 22 build, checked against `SHASUMS256.txt`),
@@ -66,6 +80,9 @@ The only scope is `drive.file`: the program sees only the files and folders it c
      `backup-manager.cmd`;
    - `backup-manager-<version>-win-x64.zip.sha256`;
    - `install.ps1`.
+
+A release is public and immediately becomes "latest", which is what `irm ... | iex` installs. Test a new version on
+a Windows VM first; to fix a bad release, publish the next patch version.
 
 `.github/workflows/ci.yml` runs `npm ci` + `npm test` on `windows-latest` and `ubuntu-latest` for every push and
 pull request, and makes Windows PowerShell 5.1 parse the `.ps1` scripts.
@@ -94,17 +111,23 @@ Open **Windows PowerShell as Administrator** and run:
 # latest release
 irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
 
-# a pinned version: download install.ps1 first
+# a pinned version
+irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/download/v1.2.0/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version 1.2.0
 ```
 
-For restoring a client's backups on another machine, use `-RestoreOnly` (no scheduled task, no backup); see
-[RESTORE.md](RESTORE.md). If GitHub is blocked, copy the zip and its `.sha256` to the machine and use `-ZipPath .\backup-manager-1.2.0-win-x64.zip`.
+Installer options (they need the `-File` form, not `irm | iex`):
+
+| Option | Use |
+| --- | --- |
+| `-Version 1.2.0` | Install that release instead of the latest |
+| `-ZipPath .\backup-manager-1.2.0-win-x64.zip` | Offline install when GitHub is blocked: copy the zip **and** its `.sha256` into the same folder first |
+| `-RestoreOnly` | Restore machine for another client's backups: no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
 
 The installer:
 
 1. Checks for Administrator rights and Windows 10/11 x64.
-2. Downloads the zip and its `.sha256` and verifies the hash.
+2. Downloads the zip and its `.sha256` (or takes them from `-ZipPath`) and verifies the hash.
 3. Extracts to `C:\Program Files\backup-manager\` (only the program files are replaced).
 4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill it in,
    save, close Notepad and press Enter.
@@ -113,10 +136,16 @@ The installer:
 6. Locks both folders down to SYSTEM and Administrators.
 7. Runs `backup-manager check` (without the Google part). On failure it stops with a plain-language explanation.
    Fix the env file and run the installer again; re-running is safe.
-8. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*).
+8. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*), then the full
+   `check` again. It stops if the signed-in account is not `GOOGLE_EMAIL`.
 9. Registers or updates the scheduled task "PunkDuck Backup Manager": daily at `BACKUP_TIME`, as SYSTEM with highest
    privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs.
 10. Runs the first backup and prints the result.
+
+**On a stock SQL Server Express, the first `check` usually fails** on one of the traps in *SQL Server
+preparation*, most often the self-signed TLS certificate: add `SQL_TRUST_SERVER_CERTIFICATE=true` to the env file
+(`notepad C:\ProgramData\backup-manager\backup-manager.env` in the Administrator PowerShell) and run the
+installer again. It keeps what you already entered.
 
 **Update:** run the installer again. It keeps the env file, the key and the Google sign-in. It refuses to update
 while a backup is running.
@@ -134,14 +163,26 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninst
 
 ### SQL Server preparation
 
-Create a SQL login for the program and give it backup rights on each database:
+Do this in SSMS, connected as an administrator, before running the installer:
+
+1. **Enable mixed-mode authentication** (Express often allows Windows logins only): server Properties > Security >
+   "SQL Server and Windows Authentication mode", then restart the SQL Server service. Without it the SQL login
+   below can't sign in.
+2. **Enable TCP/IP** in SQL Server Configuration Manager (see the table below) and restart the service.
+3. **Create a SQL login** for the program and give it backup rights on **each** database in `SQL_DATABASES`:
 
 ```sql
 CREATE LOGIN backup_user WITH PASSWORD = '<strong password>';
 USE Sales;
 CREATE USER backup_user FOR LOGIN backup_user;
 ALTER ROLE db_backupoperator ADD MEMBER backup_user;
+-- repeat USE / CREATE USER / ALTER ROLE for every other database
 ```
+
+4. **Find the backup folder** for `SQL_BACKUP_DIR`: SSMS > server Properties > Database Settings > *Backup*. Default:
+   `C:\Program Files\Microsoft SQL Server\MSSQL<nn>.<INSTANCE>\MSSQL\Backup`, where `<nn>` is 13 for SQL Server
+   2016, 14 for 2017, 15 for 2019 and 16 for 2022, and `<INSTANCE>` is e.g. `SQLEXPRESS` (or `MSSQLSERVER` for a
+   default instance).
 
 Common SQL Server Express traps, all detected by `backup-manager check`:
 
@@ -244,13 +285,16 @@ alerts us. Fix: run `auth login` again.
 
 ## Everyday commands
 
-Run in an Administrator PowerShell (`$bm = "C:\Program Files\backup-manager\backup-manager.cmd"`):
+Run in an Administrator PowerShell, after `$bm = "C:\Program Files\backup-manager\backup-manager.cmd"`.
+`--server` picks the Drive folder of another machine (`SERVER_NAME`); it is only needed on a restore machine.
 
 ```powershell
 & $bm check                                # verify settings, SQL Server, folder, Google; exit 0 only if all pass
 & $bm backup                               # back up now (what the scheduled task runs)
-& $bm list [--db Sales] [--json]           # backups on Google Drive
-& $bm download latest --db Sales --out D:\restore   # see RESTORE.md
+& $bm list [--db Sales] [--server NAME] [--json]   # backups on Google Drive
+& $bm download latest --db Sales [--server NAME] --out D:\restore   # see RESTORE.md
+& $bm auth status                          # which Google account is connected
+& $bm --help                               # all commands and options
 ```
 
 ## Logs
