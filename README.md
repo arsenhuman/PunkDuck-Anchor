@@ -22,7 +22,7 @@ If only the retention cleanup fails, the backup is still reported `OK` with a wa
 
 ## Requirements
 
-- Node.js ≥ 18.17. Node 20+ is recommended (see *Known issues*).
+- Node.js **22 LTS** (≥ 22.12). `google-auth-library@11` requires Node 22, and Node 18 and 20 are end-of-life.
 - The tool must be able to **read the directory SQL Server writes backups to**. Either run it on the
   SQL Server host, or mount that directory (NFS/SMB/Docker volume). `backupDir` is the path as
   **SQL Server** sees it. `localBackupDir` is the same directory as **this tool** sees it.
@@ -195,14 +195,14 @@ reading every file first. Everything above it describes how to *use* the tool.
 
 ### At a glance
 
-- **Language and runtime:** Node.js ≥ 18.17, ES modules (`"type": "module"`). There is no build step and no TypeScript.
+- **Language and runtime:** Node.js ≥ 22.12 (22 LTS), ES modules (`"type": "module"`). There is no build step and no TypeScript.
 - **Entry point:** `bin/backup-manager.js` → `src/cli.js` `main(argv)`. `main` returns an exit code and does not call `process.exit`.
 - **Runtime dependencies:**
   - `mssql`, the SQL Server driver (tedious).
   - `google-auth-library`, for OAuth and authorized HTTP requests.
   - `node-cron`, for scheduling.
   - The Drive API is called over **raw REST**. The project does not use `googleapis`.
-- **Tests:** `npm test` runs `node --test test/`. Nothing in the tests touches a real SQL Server, Google or the network,
+- **Tests:** `npm test` runs `node --test "test/*.test.js"`. The pattern is quoted so Node expands it, which also works in Windows `cmd`. Nothing in the tests touches a real SQL Server, Google or the network,
   except a loopback HTTP server on 127.0.0.1.
 - **Design rule:** I/O is **injected**. The orchestration in `src/backup.js` receives `drive`, `createSqlClient`,
   `logger` and `now` as parameters, which is what makes it unit-testable.
@@ -389,11 +389,5 @@ LOG_LEVEL=debug node bin/backup-manager.js backup --db Sales -c ./backup-manager
 
 ## Known issues
 
-- On Node 18 the project pins `mssql@10`, plus an npm `overrides` entry for a transitive `https-proxy-agent`.
-  This is needed because newer Azure SDK releases pulled in by `tedious` no longer load on Node 18.
-  `npm audit` reports moderate advisories in those transitive Azure and uuid packages. They are in
-  code paths this tool does not use (Azure AD auth, uuid buffer writes). On Node 20+ you can upgrade to
-  `mssql@11` and remove the override.
-- `node-cron@4` declares `engines.node >=20`, so `npm install` on Node 18 prints an `EBADENGINE`
-  warning. It runs correctly on 18.19, and the test suite covers it. `node-cron@3` would avoid the warning,
-  but it depends on a uuid version with a security advisory.
+- None currently. `npm audit` reports 0 vulnerabilities with the dependency versions in `package-lock.json`
+  (`mssql@12`, `google-auth-library@11`, `node-cron@4`).
