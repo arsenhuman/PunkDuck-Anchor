@@ -184,6 +184,15 @@ function Initialize-EnvFile {
     Copy-Item -Path (Join-Path $InstallDir "$AppName.env.template") -Destination $EnvFile
     Write-Host "Created $EnvFile from the template."
     Write-Host 'Fill in the settings in Notepad, save (Ctrl+S) and close Notepad.' -ForegroundColor Yellow
+    if (-not $RestoreOnly) {
+        Write-Host 'Required: SQL_DATABASES (the client''s databases as shown in SSMS) and SQL_INSTANCE for a named instance.' -ForegroundColor Yellow
+        Write-Host 'Leave SQL_BACKUP_DIR empty: the installer reads the backup folder from SQL Server.' -ForegroundColor Yellow
+        $services = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        if ($services.Count) {
+            $names = $services | ForEach-Object { if ($_ -eq 'MSSQLSERVER') { '(empty) = default instance' } else { $_.Substring(6) } }
+            Write-Host "SQL Server instances on this machine (SQL_INSTANCE): $($names -join ', ')" -ForegroundColor Yellow
+        }
+    }
     Write-Host 'Leave BACKUP_ENCRYPTION_KEY empty: a key is generated in the next step.' -ForegroundColor Yellow
     if (-not $RestoreOnly) {
         Write-Host 'Leave SQL_PASSWORD empty: the installer creates the SQL login and fills it in.' -ForegroundColor Yellow
@@ -244,6 +253,11 @@ $SqlWhoAmI = 'SELECT CAST(IS_SRVROLEMEMBER(''sysadmin'') AS int) AS is_sysadmin,
 $SqlDatabaseState = 'SELECT state_desc, CAST(is_read_only AS int) AS is_read_only FROM sys.databases WHERE name = @db;'
 
 $SqlLoginType = 'SELECT type FROM sys.server_principals WHERE name = @login;'
+
+$SqlUserDatabases = 'SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name;'
+
+# SQL Server 2012+: the instance's default backup folder (SSMS > server Properties > Database Settings).
+$SqlDefaultBackupPath = 'SELECT CAST(SERVERPROPERTY(''InstanceDefaultBackupPath'') AS nvarchar(4000));'
 
 # Creates the login, or resets its password if it exists. Returns 'created' or 'password reset'.
 $SqlSetLoginPassword = @'
@@ -574,9 +588,23 @@ function Initialize-SqlServer {
     # 3. Databases: all must exist, be ONLINE and writable before anything is created
     foreach ($db in $databases) {
         $row = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlDatabaseState -Params @{ db = $db })[0]
-        if (-not $row) { throw "Database '$db' (SQL_DATABASES) does not exist on $($inst.InstanceName). Fix the name in $EnvFile (as shown in SSMS)." }
+        if (-not $row) {
+            $existing = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlUserDatabases | ForEach-Object { $_.name })
+            $list = if ($existing.Count) { $existing -join ', ' } else { 'none' }
+            throw "Database '$db' (SQL_DATABASES) does not exist on $($inst.InstanceName) (databases there: $list). Fix the name in $EnvFile."
+        }
         if ($row.state_desc -ne 'ONLINE') { throw "Database '$db' is $($row.state_desc), not ONLINE." }
         if ($row.is_read_only -eq 1) { throw "Database '$db' is read-only: the installer cannot add the backup user. Make it writable or prepare it with sql-prepare.sql." }
+    }
+
+    # 3b. Backup folder: SQL Server's own default unless the technician set one
+    if (-not (Get-EnvValue $EnvFile 'SQL_BACKUP_DIR')) {
+        $backupDir = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlDefaultBackupPath -Scalar
+        if (-not $backupDir) {
+            throw "SQL Server did not report its default backup folder. Set SQL_BACKUP_DIR in $EnvFile (SSMS > server Properties > Database Settings > Backup)."
+        }
+        Set-EnvValue $EnvFile 'SQL_BACKUP_DIR' $backupDir
+        $summary.Add("Backup folder: $backupDir (SQL_BACKUP_DIR)")
     }
 
     # 4. The login

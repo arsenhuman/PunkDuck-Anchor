@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { getAuthorizedClient, logout, readToken, startLoopbackServer, writeToken } from '../src/auth.js';
+import { browserCommand, getAuthorizedClient, logout, openBrowser, readToken, startLoopbackServer, writeToken } from '../src/auth.js';
 import { tmpDir } from './helpers.js';
 
 test('token file is written atomically with 0600 permissions', async () => {
@@ -94,4 +94,20 @@ test('loopback server can be closed early', async () => {
   const s = await startLoopbackServer({ expectedState: 'abc' });
   s.close();
   await assert.rejects(fetch(`${s.redirectUri}/?state=abc&code=x`));
+});
+
+test('browserCommand opens the URL without a shell on every platform', () => {
+  const url = 'https://accounts.google.com/o/oauth2/v2/auth?a=1&b=2';
+  assert.deepEqual(browserCommand(url, 'win32'), { cmd: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', url] });
+  assert.deepEqual(browserCommand(url, 'darwin'), { cmd: 'open', args: [url] });
+  assert.deepEqual(browserCommand(url, 'linux'), { cmd: 'xdg-open', args: [url] });
+});
+
+test('openBrowser spawns detached and never throws', () => {
+  const calls = [];
+  const child = { on: (ev, fn) => calls.push(['on', ev, typeof fn]), unref: () => calls.push(['unref']) };
+  const ok = openBrowser('https://x/?a=1&b=2', { platform: 'win32', spawnFn: (cmd, args, o) => { calls.push([cmd, args, o.detached, o.stdio]); return child; } });
+  assert.equal(ok, true);
+  assert.deepEqual(calls, [['rundll32.exe', ['url.dll,FileProtocolHandler', 'https://x/?a=1&b=2'], true, 'ignore'], ['on', 'error', 'function'], ['unref']]);
+  assert.equal(openBrowser('https://x', { spawnFn: () => { throw new Error('ENOENT'); } }), false);
 });
