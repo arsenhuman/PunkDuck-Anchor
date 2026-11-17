@@ -80,7 +80,7 @@ export function normalizeConfig(raw, { env = process.env, resolveRefs = true, re
     req(!names.has(s.name), `${w}.name "${s.name}" is duplicated`);
     names.add(s.name);
     req(typeof s.host === 'string' && s.host, `${w}.host is required`);
-    req(typeof s.user === 'string' && s.user, `${w}.user is required`);
+    req(typeof s.user === 'string' && (s.user || !requireSql), `${w}.user is required`);
     req(typeof s.password === 'string', `${w}.password is required (use "env:VAR")`);
     req(Array.isArray(s.databases) && (s.databases.length > 0 || !requireSql), `${w}.databases must be a non-empty array`);
     for (const db of s.databases) {

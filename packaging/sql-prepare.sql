@@ -10,7 +10,7 @@
   on the machine where backup-manager is installed. Running it again is safe.
 
   Before running, replace (Ctrl+H in SSMS):
-    backup_user          -> SQL_USER from backup-manager.env (template default: backup_user)
+    backup_user          -> SQL_USER from backup-manager.env (keep backup_user if it is empty)
     <strong password>    -> a new strong password: letters and digits, at least 16 characters.
                             Do not use # or quotes. Put the same password into SQL_PASSWORD
                             in C:\ProgramData\backup-manager\backup-manager.env.

@@ -111,7 +111,8 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
   // A named instance is found through the SQL Browser service. Setting SQL_PORT to the instance's
   // fixed port (anything but the template's default 1433) bypasses the Browser.
   const instanceName = get('SQL_INSTANCE') && (get('SQL_PORT') === '' || port === 1433) ? get('SQL_INSTANCE') : undefined;
-  req(get('SQL_USER'), 'SQL_USER is empty');
+  req(!requireSql || get('SQL_USER'), 'SQL_USER is empty (the installer fills it in when it creates the SQL login: run it again; '
+    + 'otherwise enter an existing SQL login and its password in SQL_PASSWORD)');
   req(!requireSql || (vars.SQL_PASSWORD ?? '') !== '',
     'SQL_PASSWORD is empty (the installer fills it in when it creates the SQL login: run it again; '
     + 'if SQL Server was prepared by hand with sql-prepare.sql, enter that password)');

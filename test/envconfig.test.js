@@ -193,4 +193,10 @@ test('the packaged env template has no client-specific SQL defaults', async () =
   assert.equal(vars.SQL_DATABASES, '');
   assert.equal(vars.SQL_BACKUP_DIR, '');
   assert.equal(vars.SQL_INSTANCE, '');
+  assert.equal(vars.SQL_USER, '');
+  assert.equal(vars.SQL_PASSWORD, '');
+});
+
+test('requireSql: false lets SQL_USER be empty too (restore-only machine)', () => {
+  assert.equal(cfg({ SQL_USER: '', SQL_PASSWORD: '' }, { requireSql: false }).servers[0].user, '');
 });
