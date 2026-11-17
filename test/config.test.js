@@ -11,11 +11,11 @@ test('applies defaults and resolves env refs', () => {
   assert.equal(c.servers[0].password, 'pw');
   assert.equal(c.servers[0].port, 1433);
   assert.equal(c.servers[0].encrypt, true);
-  assert.equal(c.servers[0].localBackupDir, '/var/opt/mssql/backup');
+  assert.equal(c.servers[0].localBackupDir, path.resolve('/var/opt/mssql/backup'));
   assert.equal(c.drive.rootFolder, 'MSSQL Backups');
   assert.equal(c.compression, true);
   assert.equal(c.encryption.enabled, false);
-  assert.equal(c.schedule, undefined);
+  assert.equal('schedule' in c, false);
 });
 
 test('missing env var is a clear error', () => {
@@ -36,7 +36,6 @@ for (const [label, mutate, msg] of [
   ['bad keepLast', (c) => { c.retention = { keepLast: 0 }; }, /keepLast/],
   ['bad root folder', (c) => { c.drive = { rootFolder: 'a/b' }; }, /rootFolder/],
   ['no clientId', (c) => { delete c.google.clientId; }, /clientId/],
-  ['schedule without cron', (c) => { c.schedule = {}; }, /schedule.cron/],
 ]) {
   test(`rejects: ${label}`, () => {
     const raw = baseRawConfig();

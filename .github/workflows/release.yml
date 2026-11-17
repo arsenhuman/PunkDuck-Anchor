@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Nothing is published unless the tests pass.
+      - run: npm ci
+      - run: npm test
+
+      - name: Check that the tag matches package.json
+        shell: bash
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+
+      - name: Build the Windows package
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        run: npm run build:package
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/backup-manager-*-win-x64.zip \
+            dist/backup-manager-*-win-x64.zip.sha256 \
+            dist/install.ps1 \
+            --title "$GITHUB_REF_NAME" --generate-notes

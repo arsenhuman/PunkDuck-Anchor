@@ -1,192 +1,266 @@
-# PunkDuck-Anchor — backup-manager
+# PunkDuck-Anchor: backup-manager
 
-A Node.js CLI that takes **native SQL Server backups** (`BACKUP DATABASE … TO DISK`) and uploads
-them to the **Google Drive** of a Gmail / Google account you connect with OAuth.
+A Windows program that takes **native SQL Server backups** (`BACKUP DATABASE ... TO DISK`) every night and uploads
+them, compressed and encrypted, to the **client's own Google Drive**.
+
+- **Target:** Windows 10/11 x64, SQL Server 2016 or newer (Express included). One SQL Server per machine.
+- **Delivery:** a self-contained release zip (bundled `node.exe`, nothing to install beforehand), installed by
+  **our team over RDP** with `install.ps1`.
+- **Scheduling:** Windows Task Scheduler, task **"PunkDuck Backup Manager"**, daily, as SYSTEM.
+- **Monitoring:** Healthchecks.io, one check per client.
+- **Restores:** always done by our team. See [RESTORE.md](RESTORE.md).
 
 What one backup run does for each database:
 
 1. Checks that the database exists and is `ONLINE`.
-2. Runs `BACKUP DATABASE @db TO DISK = @path WITH CHECKSUM, COPY_ONLY, INIT, FORMAT`. The database name and path are passed as parameters and are never concatenated into the SQL.
-   `COPY_ONLY` means the tool doesn't break your existing differential or log backup chain.
-3. Runs `RESTORE VERIFYONLY … WITH CHECKSUM`.
-4. Streams the `.bak` through gzip and, if enabled, AES-256-GCM encryption.
-5. Uploads the result with a chunked, **resumable** Drive upload. Failed chunks are retried with backoff and the upload resumes from the server's offset.
-   The upload goes to `<rootFolder>/<server>/<database>/`. The tool compares Drive's MD5 and size with the local file and deletes the upload if they don't match.
+2. Runs `BACKUP DATABASE @db TO DISK = @path WITH CHECKSUM, COPY_ONLY, INIT, FORMAT`. The database name and path are
+   passed as parameters and are never concatenated into the SQL. `COPY_ONLY` means the tool doesn't break the
+   client's existing differential or log backup chain.
+3. Runs `RESTORE VERIFYONLY ... WITH CHECKSUM`.
+4. Streams the `.bak` through gzip and AES-256-GCM encryption.
+5. Uploads the result with a chunked, **resumable** Drive upload to `MSSQL Backups/<SERVER_NAME>/<database>/`, and
+   compares Drive's MD5 and size with the local file.
 6. Applies the retention policy and removes all local temporary files.
 
 If one database fails, the others still run. The exit code is `1` if any database failed.
 
-> **Working on the code?** See [Internals](#internals-for-developers-and-ai-agents). It covers the
-> architecture, data flow, storage format, invariants and how to extend the tool.
-If only the retention cleanup fails, the backup is still reported `OK` with a warning, because it is already safely on Drive.
+> **Working on the code?** See [Internals](#internals-for-developers-and-ai-agents).
 
-## Requirements
+## Paths on the client machine
 
-- Node.js **22 LTS** (≥ 22.12). `google-auth-library@11` requires Node 22, and Node 18 and 20 are end-of-life.
-- The tool must be able to **read the directory SQL Server writes backups to**. Either run it on the
-  SQL Server host, or mount that directory (NFS/SMB/Docker volume). `backupDir` is the path as
-  **SQL Server** sees it. `localBackupDir` is the same directory as **this tool** sees it.
-  It defaults to `backupDir`.
-- The SQL login needs `BACKUP DATABASE` permission on each database. Grant it with the `db_backupoperator` role,
-  plus `VIEW ANY DATABASE` (the default) so the tool can read `sys.databases`.
-- The **SQL Server service account** must be able to write to `backupDir`. The OS user running
-  this tool must be able to read **and delete** files there.
+| What | Path |
+| --- | --- |
+| Program | `C:\Program Files\backup-manager\` |
+| Settings (env file) | `C:\ProgramData\backup-manager\backup-manager.env` |
+| Google sign-in | `C:\ProgramData\backup-manager\token.json` |
+| Logs | `C:\ProgramData\backup-manager\logs\backup-YYYY-MM-DD.log` (kept 30 days) |
+| Scratch | `C:\ProgramData\backup-manager\work\` |
+
+Both folders are restricted to **SYSTEM and Administrators** by the installer (`icacls`). The data folder can be
+moved with the `BACKUP_MANAGER_HOME` environment variable (used by the tests).
+
+## One-time setup (our company)
+
+### Google OAuth client
+
+All clients use **one company-owned OAuth client** of type *Desktop app*. Each client signs in with **their own**
+Google account, and backups go to **their own** Drive. We have no access to any client's Drive.
+The only scope is `drive.file`: the program sees only the files and folders it created.
+
+1. In <https://console.cloud.google.com/>, create a project and enable the **Google Drive API**.
+2. **OAuth consent screen:** *External*. Don't upload a logo (that triggers brand verification). `drive.file` is
+   non-sensitive, so no security review is needed.
+3. **Publish to production.** In *Testing* mode, sign-ins expire after 7 days.
+4. **Credentials > Create credentials > OAuth client ID**, application type **Desktop app**.
+5. Store the client ID and secret as GitHub repository secrets `GOOGLE_OAUTH_CLIENT_ID` and
+   `GOOGLE_OAUTH_CLIENT_SECRET`. The release build writes them into `oauth-client.json` inside the zip. The file is
+   never committed. A desktop client ID is not treated as confidential by Google, so the zip can be public.
+
+### Releases
+
+1. Bump `version` in `package.json`, commit, then tag and push: `git tag v1.2.0 && git push origin v1.2.0`.
+2. `.github/workflows/release.yml` (Windows runner) runs the tests, checks that the tag matches `package.json`, runs
+   `scripts/build-package.js` and creates a GitHub Release with:
+   - `backup-manager-<version>-win-x64.zip`: `node.exe` (official Node 22 build, checked against `SHASUMS256.txt`),
+     the app, production `node_modules`, `oauth-client.json`, the env template, the install/uninstall scripts and
+     `backup-manager.cmd`;
+   - `backup-manager-<version>-win-x64.zip.sha256`;
+   - `install.ps1`.
+
+`.github/workflows/ci.yml` runs `npm ci` + `npm test` on `windows-latest` and `ubuntu-latest` for every push and
+pull request, and makes Windows PowerShell 5.1 parse the `.ps1` scripts.
+
+### Healthchecks.io (per client)
+
+1. On Healthchecks.io, **Add Check** with the client's name.
+2. Set **Period = 1 day** and **Grace Time = 4 days**. The alert fires after **5 days** without a successful backup.
+3. Under **Integrations**, set who gets the alert.
+4. Put the check's ping URL (`https://hc-ping.com/<uuid>`) in the client's `HEALTHCHECK_URL`. Treat it like a
+   password: anyone with the URL can send pings.
+
+After each run, the program pings the check **only if every database succeeded**. The body is a short summary
+(`3/3 OK` plus one line per database); it never contains passwords, keys or backup data. If a backup fails, the
+machine is off, or the client revoked Google access, the pings stop and Healthchecks alerts us.
+The ping is best-effort (10 s timeout, 3 attempts) and never changes the backup result.
+
+## Installing on a client machine (over RDP)
+
+Before you start, have ready: the SQL login (see *SQL Server preparation*), the client's Gmail address and password
+(or the client at hand to sign in), the Healthchecks ping URL, and access to the company password manager.
+
+Open **Windows PowerShell as Administrator** and run:
+
+```powershell
+# latest release
+irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
+
+# a pinned version: download install.ps1 first
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version 1.2.0
+```
+
+For restoring a client's backups on another machine, use `-RestoreOnly` (no scheduled task, no backup); see
+[RESTORE.md](RESTORE.md). If GitHub is blocked, copy the zip and its `.sha256` to the machine and use `-ZipPath .\backup-manager-1.2.0-win-x64.zip`.
+
+The installer:
+
+1. Checks for Administrator rights and Windows 10/11 x64.
+2. Downloads the zip and its `.sha256` and verifies the hash.
+3. Extracts to `C:\Program Files\backup-manager\` (only the program files are replaced).
+4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill it in,
+   save, close Notepad and press Enter.
+5. If `BACKUP_ENCRYPTION_KEY` is empty, generates a key, writes it into the env file and **shows it once**.
+   **Store it in the company password manager** under the client, then type `SAVED`.
+6. Locks both folders down to SYSTEM and Administrators.
+7. Runs `backup-manager check` (without the Google part). On failure it stops with a plain-language explanation.
+   Fix the env file and run the installer again; re-running is safe.
+8. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*).
+9. Registers or updates the scheduled task "PunkDuck Backup Manager": daily at `BACKUP_TIME`, as SYSTEM with highest
+   privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs.
+10. Runs the first backup and prints the result.
+
+**Update:** run the installer again. It keeps the env file, the key and the Google sign-in. It refuses to update
+while a backup is running.
+
+**Uninstall:**
+
+```powershell
+# removes the scheduled task and the program folder; keeps C:\ProgramData\backup-manager
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1"
+# also revokes the Google sign-in and deletes C:\ProgramData\backup-manager
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1" -Purge
+```
+
+**Backups on Google Drive are never touched** by the uninstaller.
+
+### SQL Server preparation
+
+Create a SQL login for the program and give it backup rights on each database:
 
 ```sql
+CREATE LOGIN backup_user WITH PASSWORD = '<strong password>';
 USE Sales;
 CREATE USER backup_user FOR LOGIN backup_user;
 ALTER ROLE db_backupoperator ADD MEMBER backup_user;
 ```
 
-## Install
+Common SQL Server Express traps, all detected by `backup-manager check`:
 
-```bash
-npm install
-npm link        # optional: puts `backup-manager` on your PATH
+| Problem | Fix |
+| --- | --- |
+| **TCP/IP is disabled** (Express default) | SQL Server Configuration Manager > SQL Server Network Configuration > Protocols > enable TCP/IP, restart the SQL Server service |
+| **SQL Browser stopped** with a named instance (`SQL_INSTANCE=SQLEXPRESS`) | Start the "SQL Server Browser" service (Automatic), or set `SQL_PORT` to the instance's fixed port |
+| **Mixed-mode authentication disabled** (Windows logins only) | SSMS > server Properties > Security > "SQL Server and Windows Authentication mode", restart |
+| **Login failed** | Wrong `SQL_USER`/`SQL_PASSWORD`, or the login is disabled |
+| **Self-signed TLS certificate** | Add `SQL_TRUST_SERVER_CERTIFICATE=true` (fine for a SQL Server on the same machine) |
+| **No backup compression on Express** | Nothing to do: native compression stays off and the program compresses with gzip |
+
+## Settings: `backup-manager.env`
+
+The env file is the **only** supported configuration. Format: `KEY=VALUE`, `#` starts a comment line.
+
+```ini
+# ---- SQL Server ----
+SQL_HOST=localhost
+SQL_PORT=1433
+# For a named instance such as SQLEXPRESS (needs the SQL Browser service, or set SQL_PORT instead):
+SQL_INSTANCE=
+SQL_USER=backup_user
+SQL_PASSWORD=
+# Comma-separated
+SQL_DATABASES=Sales,HR
+# Folder SQL Server writes backups to (must be readable by this program)
+SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.SQLEXPRESS\MSSQL\Backup
+
+# ---- Naming on Google Drive (default: computer name) ----
+SERVER_NAME=
+
+# ---- Google account (the client's own Gmail; backups go to THEIR Drive) ----
+GOOGLE_EMAIL=client@gmail.com
+
+# ---- Schedule & retention ----
+BACKUP_TIME=02:00
+KEEP_LAST=7
+KEEP_DAYS=30
+
+# ---- Monitoring (Healthchecks.io ping URL for this client) ----
+HEALTHCHECK_URL=
+
+# ---- Encryption (ON by default; leave empty and the installer generates a key and shows it ONCE) ----
+BACKUP_ENCRYPTION_KEY=
 ```
-
-## 1. Create a Google OAuth client (one time)
-
-1. Open <https://console.cloud.google.com/> and create (or pick) a project.
-2. Go to **APIs & Services → Library** and enable the **Google Drive API**.
-3. Go to **APIs & Services → OAuth consent screen**, choose *External*, and fill in the app name and
-   your email. Add your Gmail address under **Test users**. While the app is in *Testing* mode,
-   Google expires refresh tokens after 7 days. **Publish** the app to avoid that. It only
-   requests the non-sensitive `drive.file` scope, so verification is not required.
-4. Go to **APIs & Services → Credentials → Create credentials → OAuth client ID**, with application type
-   **Desktop app**. Copy the client ID and secret.
-
-The tool only asks for `https://www.googleapis.com/auth/drive.file`. It can see and change **only
-the files it created**, never the rest of your Drive.
-
-## 2. Configure
-
-```bash
-cp backup-manager.example.json backup-manager.json
-export GOOGLE_CLIENT_SECRET='...'
-export MSSQL_PASSWORD='...'
-export BACKUP_ENCRYPTION_KEY="$(backup-manager keygen)"   # if encryption.enabled — STORE THIS KEY SAFELY
-```
-
-Any string value can be written as `"env:VAR_NAME"` to read it from the environment.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `google.clientId` / `clientSecret` | — (required) | The OAuth client from step 1 |
-| `google.tokenFile` | `~/.config/backup-manager/token.json` | Where the refresh token is stored (mode 0600) |
-| `drive.rootFolder` | `MSSQL Backups` | Top-level Drive folder |
-| `servers[].name` | — | Short label `[A-Za-z0-9._-]`, used as the Drive sub-folder |
-| `servers[].host`, `port`, `instanceName` | port `1433` | Connection settings |
-| `servers[].user`, `password` | — | SQL login |
-| `servers[].encrypt`, `trustServerCertificate` | `true`, `false` | TLS to SQL Server |
-| `servers[].databases` | — | Databases to back up |
-| `servers[].backupDir` | — | Backup directory as SQL Server sees it (Linux or Windows path) |
-| `servers[].localBackupDir` | `backupDir` | The same directory as this tool sees it |
-| `servers[].nativeCompression` | `false` | Adds `WITH COMPRESSION` (not available on Express edition) |
-| `servers[].requestTimeoutMs` | 6 h | Max time for a single BACKUP statement (`0` = no limit) |
-| `retention.keepLast` | — | Keep the newest N backups per database |
-| `retention.keepDays` | — | Keep backups younger than N days |
-| `compression` | `true` | gzip before upload |
-| `encryption.enabled` / `keyEnv` | `false` / `BACKUP_ENCRYPTION_KEY` | AES-256-GCM. The key is 32 bytes, base64 or hex |
-| `workDir` | OS temp dir + `/backup-manager` | Scratch space for compressed or encrypted files |
-| `schedule.cron` / `timezone` | — | Used by `backup-manager schedule` |
-| `monitoring.heartbeatUrl` | — (off) | Healthchecks.io ping URL (`https://` only). See *Monitoring* |
+| `SQL_HOST` | `localhost` | SQL Server host. It must run on this machine (the program reads the `.bak` from `SQL_BACKUP_DIR`) |
+| `SQL_PORT` | `1433` | TCP port. With `SQL_INSTANCE` set, a value other than 1433 means "connect to this port directly, skip SQL Browser" |
+| `SQL_INSTANCE` | (none) | Named instance, e.g. `SQLEXPRESS`. Found through the SQL Browser service |
+| `SQL_USER`, `SQL_PASSWORD` | required | SQL login |
+| `SQL_DATABASES` | required | Comma-separated database names |
+| `SQL_BACKUP_DIR` | required | Folder SQL Server writes backups to |
+| `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
+| `GOOGLE_EMAIL` | (none) | Expected Google account; used as the sign-in hint, and `check` fails if a different account is signed in |
+| `BACKUP_TIME` | `02:00` | Daily start time (24-hour `HH:MM`), used by the installer for the scheduled task. Re-run the installer after changing it |
+| `KEEP_LAST` / `KEEP_DAYS` | (none) | Retention: a backup is kept if it is one of the newest `KEEP_LAST` **or** younger than `KEEP_DAYS`. The newest backup is never deleted. With neither set, nothing is deleted |
+| `HEALTHCHECK_URL` | (none: monitoring off) | Healthchecks.io ping URL, `https://` only |
+| `BACKUP_ENCRYPTION_KEY` | required | 32-byte key, base64 or hex. **Never change it** after the first backup; old backups need the old key |
+| `SQL_ENCRYPT` / `SQL_TRUST_SERVER_CERTIFICATE` | `true` / `false` | TLS to SQL Server (optional, not in the template) |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (optional) |
 
-**Retention:** a backup is kept if **any** configured rule keeps it. That means it is either one of the newest
-`keepLast`, or younger than `keepDays`. The newest backup is never deleted. With no rules set,
-nothing is deleted. Deleted backups are removed permanently and do not go to the Drive trash.
+Rules:
+- **Values containing `#` must be quoted with single quotes**, e.g. `SQL_PASSWORD='ab#12'`. An unquoted `#` is
+  rejected rather than silently cutting the value. Don't use double quotes around Windows paths (`\n` would be
+  turned into a line break).
+- Unknown keys are reported as errors, so typos don't go unnoticed.
+- Every error names the key to fix, e.g. `SQL_DATABASES is empty`.
 
-**Encryption:** if you lose the key, you cannot restore the backups. Keep it somewhere other than
-the Google account, for example in a password manager.
+## Google sign-in
 
-## 3. Connect your Google account
+`backup-manager auth login` (run by the installer) prints a Google sign-in URL.
 
-```bash
-backup-manager auth login --email you@gmail.com
+- **With a browser on the machine:** open the URL, sign in with the client's account and approve. Google redirects to a
+  temporary `http://127.0.0.1:<port>` listener and the program finishes by itself.
+- **Without a usable browser** (the usual case over RDP): open the URL on **your own laptop**, sign in with the
+  client's account and approve. The browser then tries to open `http://127.0.0.1:...` and **fails to load; that is
+  expected**. Copy that full address from the address bar and paste it into the RDP console, then press Enter.
+  Pasting only the `code` value also works.
+
+The `state` value in a pasted address is checked, and the code is always redeemed with this login's PKCE verifier,
+so a code from any other sign-in is useless. Only the refresh token is stored (`token.json`).
+
+```powershell
+& "C:\Program Files\backup-manager\backup-manager.cmd" auth status   # which account is connected
+& "C:\Program Files\backup-manager\backup-manager.cmd" auth logout   # revoke and delete the sign-in
 ```
 
-This prints a Google consent URL. Open it, sign in with your Gmail account and approve.
-Google redirects to a temporary `http://127.0.0.1:<random port>` listener started by the tool.
-The login uses PKCE and a `state` check. Only the refresh token is saved.
+**If a client revokes access** (or changes their Google password in some cases), uploads stop and Healthchecks
+alerts us. Fix: run `auth login` again.
 
-On a headless server, run `auth login` on a machine with a browser, then copy the token file
-to the server with mode 0600.
+## Encryption key
 
-```bash
-backup-manager auth status    # shows the connected Gmail address
-backup-manager auth logout    # revokes the token at Google and deletes it locally
+- Encryption is **always on** (AES-256-GCM, `BMENC2` format).
+- The installer generates the key and shows it **once**. We store it in the **company password manager**. It also
+  stays in the ACL-protected env file, because the nightly backups need it.
+- **If the key is lost, that client's backups cannot be restored.**
+
+## Everyday commands
+
+Run in an Administrator PowerShell (`$bm = "C:\Program Files\backup-manager\backup-manager.cmd"`):
+
+```powershell
+& $bm check                                # verify settings, SQL Server, folder, Google; exit 0 only if all pass
+& $bm backup                               # back up now (what the scheduled task runs)
+& $bm list [--db Sales] [--json]           # backups on Google Drive
+& $bm download latest --db Sales --out D:\restore   # see RESTORE.md
 ```
-
-## 4. Use it
-
-```bash
-backup-manager backup                       # all configured databases
-backup-manager backup --server prod --db Sales
-backup-manager list [--db Sales] [--json]
-backup-manager download latest --db Sales --out ./restore
-backup-manager download <fileId> --out ./restore
-backup-manager schedule                     # long-running, uses schedule.cron
-```
-
-`download` checks the SHA-256, then decrypts and decompresses, and writes a plain `.bak` file. It won't overwrite an
-existing file unless you pass `--force`. Restoring that
-file into SQL Server is a manual step on purpose, for example:
-
-```sql
-RESTORE DATABASE Sales_restored FROM DISK = N'/var/opt/mssql/backup/Sales_20261116T020000Z.bak'
-WITH MOVE 'Sales' TO '/var/opt/mssql/data/Sales_restored.mdf',
-     MOVE 'Sales_log' TO '/var/opt/mssql/data/Sales_restored_log.ldf';
-```
-
-### Running on a schedule
-
-There are two ways. You can run `backup-manager schedule` under systemd or pm2, which will skip a tick if the previous run is still going
-and waits for a running backup to finish on SIGTERM. Or you can call `backup-manager backup` from
-system cron, for example:
-
-```cron
-0 2 * * * cd /opt/backup-manager && ./bin/backup-manager.js backup >> /var/log/backup-manager.log 2>&1
-```
-
-## Monitoring (Healthchecks.io)
-
-The tool can send a heartbeat to [Healthchecks.io](https://healthchecks.io) (the free plan has 20 checks), so
-you get an email when a client's backups **stop**. You don't have to log in to the client's server to check.
-
-How it works:
-- After each `backup` or scheduled run, the tool pings the check **only if every database succeeded**.
-  The request body is a short summary, for example `3/3 OK` followed by one line per database with its file name and size.
-  You can read it in the check's event log. It never contains passwords, keys or backup data.
-- If any database fails, **no ping is sent**. If the server is off, the task isn't running, or backups keep
-  failing, the pings stop and Healthchecks.io alerts you.
-- The ping is best-effort. It times out after 10 s and is retried up to 3 times. If it still fails, a warning is logged.
-  A failed ping never changes the backup result or the exit code.
-
-Setup, once per client server:
-1. On Healthchecks.io, click **Add Check** and give it the client's name.
-2. Set **Period = 1 day** and **Grace Time = 4 days**. The alert then fires after **5 days** without a successful backup.
-   For backups that run every day, a shorter grace time catches problems sooner.
-3. Copy the check's ping URL (`https://hc-ping.com/<uuid>`) into that client's config:
-   ```json
-   "monitoring": { "heartbeatUrl": "env:HEALTHCHECK_URL" }
-   ```
-   You can also paste the URL directly. Treat it like a password, because anyone with the URL can send pings.
-   If you use `env:HEALTHCHECK_URL`, that variable **must be set**: a missing variable is a config error
-   for every command, so a typo can't switch monitoring off without anyone noticing. To turn monitoring off, remove the
-   `monitoring` section or set `"heartbeatUrl": ""`.
-   `backup-manager.example.json` contains a placeholder URL. The tool refuses to start until you replace it or remove the section.
-4. Under **Integrations**, set the email address (or Telegram, Slack, …) that should get the alert.
-
-If you leave `monitoring` out, or leave `heartbeatUrl` empty, the tool sends nothing.
-
-Note: a manual run limited with `--server` or `--db` also pings when the databases it backed up all succeeded.
-If Healthchecks.io can't be reached, a one-shot `backup` can take up to about 45 s longer to exit:
-3 attempts with 10 s timeouts, plus the network library's connect timeout. The exit code is unaffected.
 
 ## Logs
 
-Logs are JSON lines on stderr. The level is set by `LOG_LEVEL`: `debug|info|warn|error`. Passwords, tokens and keys
-are redacted.
+Each run appends JSON lines to `C:\ProgramData\backup-manager\logs\backup-YYYY-MM-DD.log` (local date) and also
+writes them to stderr. Passwords, tokens and keys are redacted. Log files older than 30 days are deleted at the start
+of each run.
+
+To see why a scheduled run failed: Task Scheduler > "PunkDuck Backup Manager" > Last Run Result, then the log file
+of that day.
 
 ## Internals (for developers and AI agents)
 
@@ -195,12 +269,14 @@ reading every file first. Everything above it describes how to *use* the tool.
 
 ### At a glance
 
-- **Language and runtime:** Node.js ≥ 22.12 (22 LTS), ES modules (`"type": "module"`). There is no build step and no TypeScript.
+- **Language and runtime:** Node.js ≥ 22.12 (22 LTS), ES modules (`"type": "module"`). No TypeScript. The only build step
+  is packaging the Windows release (`npm run build:package`).
+- **Product shape:** Windows-only. Settings come from the env file (`src/envconfig.js`), paths from `src/paths.js`,
+  scheduling from Windows Task Scheduler (`packaging/install.ps1`). There is no in-process scheduler.
 - **Entry point:** `bin/backup-manager.js` → `src/cli.js` `main(argv)`. `main` returns an exit code and does not call `process.exit`.
 - **Runtime dependencies:**
   - `mssql`, the SQL Server driver (tedious).
   - `google-auth-library`, for OAuth and authorized HTTP requests.
-  - `node-cron`, for scheduling.
   - The Drive API is called over **raw REST**. The project does not use `googleapis`.
 - **Tests:** `npm test` runs `node --test "test/*.test.js"`. The pattern is quoted so Node expands it, which also works in Windows `cmd`. Nothing in the tests touches a real SQL Server, Google or the network,
   except a loopback HTTP server on 127.0.0.1.
@@ -211,18 +287,24 @@ reading every file first. Everything above it describes how to *use* the tool.
 
 | File | Responsibility | Key exports |
 | --- | --- | --- |
+| `packaging/install.ps1`, `uninstall.ps1` | Windows install/update/uninstall (PowerShell 5.1, pure ASCII) | — |
+| `packaging/backup-manager.cmd` | Launcher: runs `bin/backup-manager.js` with the bundled `node.exe` | — |
+| `packaging/backup-manager.env.template` | Commented env file template copied by the installer | — |
+| `scripts/build-package.js` | Builds the release zip (downloads + verifies Node, `npm ci --omit=dev`, writes `oauth-client.json`) | `build`, `verifyShasum`, `oauthClientJson` |
 | `bin/backup-manager.js` | Shebang wrapper: runs `main`, sets `process.exitCode`, prints `Error: …` for uncaught errors | — |
 | `src/cli.js` | Argument parsing (`node:util` `parseArgs`), command dispatch, human/JSON output | `main`, `USAGE` |
-| `src/config.js` | Loads JSON config, resolves `env:VAR`, validates, applies defaults, parses the encryption key | `loadConfig`, `normalizeConfig`, `ConfigError`, `parseEncryptionKey` |
-| `src/auth.js` | OAuth installed-app flow (loopback + PKCE + state), token file I/O, status, logout/revoke | `login`, `status`, `logout`, `getAuthorizedClient`, `startLoopbackServer` |
-| `src/mssql.js` | SQL text builders + `MssqlClient` wrapper (connect, online check, BACKUP, VERIFYONLY) | `MssqlClient`, `buildBackupSql`, `buildVerifySql`, `toPoolConfig` |
+| `src/envconfig.js` | Parses `backup-manager.env` (`util.parseEnv`), validates with env-key error messages, maps onto `normalizeConfig`; reads `oauth-client.json` | `loadEnvConfig`, `envToConfig`, `parseEnvText`, `ENV_KEYS` |
+| `src/paths.js` | Program folder (`APP_ROOT`) and data folder (`BACKUP_MANAGER_HOME`, default `C:\ProgramData\backup-manager`) | `appHome`, `appPaths`, `APP_ROOT` |
+| `src/check.js` | The `check` command: all checks with injected I/O, SQL error explanations | `runChecks`, `explainSqlError`, `formatChecks` |
+| `src/config.js` | Validates and applies defaults (`normalizeConfig`); internal JSON loader (`-c`, development only) | `loadConfig`, `normalizeConfig`, `ConfigError`, `parseEncryptionKey` |
+| `src/auth.js` | OAuth installed-app flow (loopback + PKCE + state, plus paste fallback), token file I/O, status, logout/revoke | `login`, `status`, `logout`, `getAuthorizedClient`, `startLoopbackServer`, `parsePastedRedirect` |
+| `src/mssql.js` | SQL text builders + `MssqlClient` wrapper (connect, online check, BACKUP permission, version, BACKUP, VERIFYONLY) | `MssqlClient`, `buildBackupSql`, `buildVerifySql`, `toPoolConfig` |
 | `src/drive.js` | Minimal Drive v3 client: folders, list, chunked resumable upload, download, delete, retry policy | `DriveStore`, `isRetryable`, `escapeQuery`, `APP_TAG` |
 | `src/transform.js` | Streaming gzip, segmented AES-256-GCM encrypt/decrypt, hashing (SHA-256 + MD5) | `packFile`, `unpackFile`, `hashFile`, `createEncryptStream`, `createDecryptStream` |
 | `src/backup.js` | Orchestration: backup → verify → pack → upload → check → retention; list; download | `runBackups`, `backupOne`, `applyRetention`, `listBackups`, `downloadBackup`, `selectTargets` |
 | `src/retention.js` | Pure function that decides which backups to delete | `selectForDeletion` |
 | `src/naming.js` | File names, timestamps, server-side path joining (Windows or Linux), artifact suffixes | `backupBaseName`, `joinServerPath`, `artifactName`, `parseArtifactName` |
-| `src/scheduler.js` | Cron wrapper with an in-process overlap guard | `startScheduler`, `nonOverlapping` |
-| `src/logger.js` | JSON-lines logger to stderr with secret redaction | `createLogger`, `redact`, `silentLogger` |
+| `src/logger.js` | JSON-lines logger to stderr and the daily log file, secret redaction, 30-day cleanup | `createLogger`, `cleanupLogs`, `redact`, `silentLogger` |
 | `src/heartbeat.js` | Healthchecks.io ping after a fully successful run (best-effort, never throws) | `sendHeartbeat`, `buildSummary` |
 | `src/format.js` | Shared formatting helpers | `fmtBytes` |
 
@@ -276,9 +358,10 @@ My Drive/
 
 | Path | Written by | Lifetime |
 | --- | --- | --- |
-| `servers[].backupDir/<base>.bak` (SQL Server's view) = `localBackupDir/<base>.bak` (our view) | SQL Server | Deleted in `backupOne`'s `finally` |
+| `SQL_BACKUP_DIR/<base>.bak` | SQL Server | Deleted in `backupOne`'s `finally` |
 | `workDir/<artifact>` | `packFile` (mode 0600) | Deleted in `backupOne`'s `finally` |
-| `google.tokenFile` | `auth.writeToken` (atomic write via tmp + rename, mode 0600, dir 0700) | Until `auth logout` |
+| `<data>/token.json` | `auth.writeToken` (atomic write via tmp + rename; mode 0600 on Linux, folder ACL on Windows) | Until `auth logout` |
+| `<data>/logs/backup-YYYY-MM-DD.log` | `createLogger` | 30 days (`cleanupLogs` at the start of each run) |
 | `<outDir>/<base>.bak.download` and `.partial` | `downloadBackup` | Temporary. Renamed to `<base>.bak` on success, removed on failure |
 
 Token file contents: `{ "refresh_token", "scope", "email", "createdAt" }`. No access token is stored.
@@ -297,7 +380,7 @@ AAD        = the 13-byte header
 - **Decryptor.** Opens a segment that isn't the last only when `pending > segmentSize + 16`. It always holds the last sealed segment back until `flush`, where it opens it with `lastFlag=1`.
 - **Keep the two rules matched.** They are what make truncation at a segment boundary detectable. If you change one, change the other and run `test/review-fixes.test.js`.
 - **Order of operations.** Compression happens **before** encryption.
-- **Key.** 32 raw bytes, from the env var named by `encryption.keyEnv`, given as base64 or 64 hex characters.
+- **Key.** 32 raw bytes, from `BACKUP_ENCRYPTION_KEY` in the env file, given as base64 or 64 hex characters.
 
 ### Invariants: do not break these
 
@@ -309,8 +392,8 @@ AAD        = the 13-byte header
 5. **Never delete the newest backup.** Retention keeps a file if *any* rule keeps it (`keepLast` or `keepDays`).
 6. **Never log secrets.** Use the logger. It redacts keys that match `/pass|secret|token|authorization|api.?key|encryption.?key/`
    and scrubs `Bearer …` and `refresh_token=…` from messages. Don't `console.log` config objects.
-7. **Booleans in config are strict.** Only `true`, `false`, `"true"` or `"false"` are accepted, through `bool()` in `config.js`.
-   This prevents `"enabled": "yes"` from silently disabling encryption.
+7. **Settings are strict.** Booleans accept only `true`/`false`; unknown env keys and unquoted `#` are errors; every
+   error names the env key. This prevents typos from silently changing behaviour.
 8. **OAuth scope stays `drive.file`.** Wider scopes need Google app verification and expose the user's whole Drive.
 9. **`download` refuses unsafe names and doesn't overwrite** without `force`. File names come from Drive and are untrusted.
 
@@ -331,10 +414,10 @@ AAD        = the 13-byte header
 
 ### Errors and exit codes
 
-- **Exit codes:** `0` on success. `1` on a runtime error, when any database failed, or for `auth status` when not logged in. `2` on a usage error.
+- **Exit codes:** `0` on success. `1` on a runtime error, when any database failed, when any `check` fails, or for `auth status` when not logged in. `2` on a usage error.
 - **Error types:** `ConfigError` (config problems) and `AuthError` (not logged in, OAuth failure). Other errors carry plain messages.
-  Messages are written to be acted on, for example "check that servers[].localBackupDir points to the same directory as backupDir".
-- **Logs:** JSON lines on **stderr**. Command output (results, lists) goes to **stdout**, so `--json` output can be piped.
+  Messages are written to be acted on and name the env key, for example "SQL_DATABASES is empty".
+- **Logs:** JSON lines on **stderr** and in the daily log file. Command output (results, lists) goes to **stdout**, so `--json` output can be piped.
 
 ### Testing approach
 
@@ -344,8 +427,11 @@ AAD        = the 13-byte header
 | `test/backup.test.js` | Orchestration with a fake SQL client that writes random bytes as the "`.bak`": partial failure, round trip, retention, checksum mismatch |
 | `test/transform.test.js`, `test/review-fixes.test.js` | Encryption round trips at segment boundaries, plus tamper, truncation, reorder and wrong-key detection |
 | `test/drive.test.js` | Folder creation and reuse, chunked upload and resume, list, download, delete, retry rules |
-| `test/auth.test.js` | Token file permissions, the loopback server (good state, CSRF state, denial, timeout, multibyte state) and logout |
-| `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `scheduler`, `cli` | Unit tests for the pure parts |
+| `test/auth.test.js` | Token file permissions, the loopback server (good state, CSRF state, denial, timeout), the paste fallback and logout |
+| `test/envconfig.test.js` | Env file parsing and mapping, env-key error messages, paths and `BACKUP_MANAGER_HOME` |
+| `test/check.test.js` | Every `check` outcome with fake SQL/Google, SQL Express error explanations |
+| `test/build-package.test.js` | Release build helpers (SHASUMS verification, `oauth-client.json`, Node version) |
+| `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `cli` | Unit tests for the pure parts, log files, CLI with `BACKUP_MANAGER_HOME` |
 
 Testing patterns to reuse:
 - `DriveStore` takes any `request(opts) → {status, data, headers}` function. In production that is `OAuth2Client#request`. In tests, use `createFakeDriveApi().request`.
@@ -354,19 +440,24 @@ Testing patterns to reuse:
 
 ### How to make common changes
 
-- **Add a config option.** Validate it and give it a default in `normalizeConfig` (`src/config.js`); use `bool()` for booleans.
-  Then document it in the README config table, add it to `backup-manager.example.json`, and add a case to `test/config.test.js`.
+- **Add a setting.** Add the key to `ENV_KEYS` and map/validate it in `envToConfig` (`src/envconfig.js`) with an error
+  that names the key; add internal validation in `normalizeConfig` if needed. Document it in the README settings table,
+  add it to `packaging/backup-manager.env.template` if technicians should see it, and add cases to `test/envconfig.test.js`.
 - **Add a CLI command.** Add a `case` in `main()` (`src/cli.js`), any new flags to `OPTIONS`, and a line in `USAGE`.
   Keep the logic in `src/backup.js`, or in a new module that takes injected dependencies, so it can be tested.
 - **Add a storage backend** (S3, OneDrive, …). Implement the same surface `backup.js` uses from `DriveStore`:
   `ensurePath`, `resolvePath`, `listSubfolders`, `listBackups`, `getFile`, `uploadResumable`, `download` and `deleteFile`.
   Uploaded files must keep the `appProperties` semantics (or an equivalent metadata store).
 - **Change the backup SQL.** Edit `buildBackupSql` and `buildVerifySql` in `src/mssql.js` and update `test/mssql.test.js`. Keep invariants 1 and 2.
-- **Add notifications** (email, Slack). Hook into the result of `runBackups()` in `cli.js` (`backup` and `schedule` cases). Don't put them inside `backupOne`.
+- **Add notifications** (email, Slack). Hook into the result of `runBackups()` in the `backup` case of `cli.js`. Don't put them inside `backupOne`.
+- **Change the Windows scripts.** Keep them pure ASCII and compatible with Windows PowerShell 5.1; CI parses them with 5.1.
+  Under `irm | iex`, never call `exit` (it closes the technician's window): throw instead.
 
 ### Deliberately out of scope
 
-- Web UI, Docker image, automatic `RESTORE DATABASE` into SQL Server, multi-user tenancy, notifications and service-account auth.
+- Web UI, Docker image, automatic `RESTORE DATABASE` into SQL Server (a `restore` command), key escrow, code signing,
+  Windows Server/Linux/macOS targets, Windows Event Log, several SQL Server instances per machine, notifications and
+  service-account auth.
 - Differential and transaction-log backups. Every backup is a full `COPY_ONLY` backup.
 - Per-database retention overrides. Retention is global and applied separately to each database's folder.
 
@@ -380,14 +471,26 @@ Testing patterns to reuse:
 
 ## Development
 
+Development happens on Linux with Node 22.
+
 ```bash
 npm install
 npm test                         # all unit tests (no network, no SQL Server)
 node --test test/drive.test.js   # a single file
-LOG_LEVEL=debug node bin/backup-manager.js backup --db Sales -c ./backup-manager.json
+
+# run against a local env file instead of C:\ProgramData
+export BACKUP_MANAGER_HOME=~/.config/backup-manager      # holds backup-manager.env, token.json, logs/
+export BACKUP_MANAGER_OAUTH_CLIENT=./oauth-client.json   # Google "Desktop app" client JSON
+node bin/backup-manager.js check
+
+# build the release zip locally (needs network)
+GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... npm run build:package
 ```
+
+The internal JSON config (`-c backup-manager.json`, see `backup-manager.example.json`) still works for development
+and is not documented for clients.
 
 ## Known issues
 
-- None currently. `npm audit` reports 0 vulnerabilities with the dependency versions in `package-lock.json`
-  (`mssql@12`, `google-auth-library@11`, `node-cron@4`).
+- The `.ps1` scripts can't be exercised in CI (they need Administrator, Task Scheduler and a real SQL Server);
+  CI only checks that Windows PowerShell 5.1 parses them. Test a new release on a Windows VM before rolling it out.

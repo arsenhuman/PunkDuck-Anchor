@@ -31,7 +31,7 @@ for (const [compress, useKey] of [[true, true], [true, false], [false, true]]) {
     await unpackFile(packed, out, { compressed: compress, encrypted: useKey, key: useKey ? key : undefined });
     assert.ok(data.equals(await fs.readFile(out)));
     const st = await fs.stat(packed);
-    assert.equal(st.mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(st.mode & 0o777, 0o600); // Windows: ACLs set by install.ps1
   });
 }
 

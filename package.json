@@ -10,13 +10,16 @@
     "node": ">=22.12"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "build:package": "node scripts/build-package.js"
   },
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
     "google-auth-library": "^11.3.4",
-    "mssql": "^12.7.14",
-    "node-cron": "^4.6.0"
+    "mssql": "^12.7.14"
+  },
+  "devDependencies": {
+    "adm-zip": "0.6.1"
   }
 }

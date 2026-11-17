@@ -9,7 +9,7 @@ test('token file is written atomically with 0600 permissions', async () => {
   const dir = await tmpDir();
   const file = path.join(dir, 'nested', 'token.json');
   await writeToken(file, { refresh_token: 'r', email: 'a@gmail.com' });
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal((await fs.stat(file)).mode & 0o777, 0o600); // Windows: ACLs set by install.ps1
   assert.deepEqual(await readToken(file), { refresh_token: 'r', email: 'a@gmail.com' });
   assert.equal(await readToken(path.join(dir, 'none.json')), null);
 });
@@ -54,4 +54,44 @@ test('loopback server reports user denial and timeout', async () => {
   await denied;
   s = await startLoopbackServer({ expectedState: 'abc', timeoutMs: 20 });
   await assert.rejects(s.code, /timed out/);
+});
+
+test('pasted redirect URL: state is verified, code extracted', async () => {
+  const { parsePastedRedirect } = await import('../src/auth.js');
+  assert.equal(parsePastedRedirect('http://127.0.0.1:51234/?state=abc&code=4%2F0AXyz&scope=x', 'abc'), '4/0AXyz');
+  assert.equal(parsePastedRedirect('  "http://127.0.0.1:1/?code=c1&state=abc"  ', 'abc'), 'c1');
+  assert.equal(parsePastedRedirect('?state=abc&code=c2', 'abc'), 'c2');
+  assert.throws(() => parsePastedRedirect('http://127.0.0.1:1/?state=evil&code=c', 'abc'), /state mismatch/);
+  assert.throws(() => parsePastedRedirect('http://127.0.0.1:1/?code=c', 'abc'), /state mismatch/);
+  assert.throws(() => parsePastedRedirect('http://127.0.0.1:1/?state=abc&error=access_denied', 'abc'), /access_denied/);
+  assert.throws(() => parsePastedRedirect('http://127.0.0.1:1/?state=abc', 'abc'), /no code/);
+});
+
+test('pasted bare code is accepted (PKCE still binds it to this login)', async () => {
+  const { parsePastedRedirect } = await import('../src/auth.js');
+  assert.equal(parsePastedRedirect('4/0AXyz-_.~', 'abc'), '4/0AXyz-_.~');
+  assert.equal(parsePastedRedirect('4%2F0AX', 'abc'), '4/0AX');
+  assert.throws(() => parsePastedRedirect('', 'abc'), /nothing was pasted/);
+  assert.throws(() => parsePastedRedirect('not a code', 'abc'), /neither a URL nor/);
+});
+
+test('waitForPastedCode retries on junk, aborts on state mismatch', async () => {
+  const { PassThrough } = await import('node:stream');
+  const { waitForPastedCode } = await import('../src/auth.js');
+  let input = new PassThrough();
+  const invalid = [];
+  let w = waitForPastedCode({ input, expectedState: 'abc', onInvalid: (e) => invalid.push(e.message) });
+  input.write('hello world\n\nhttp://127.0.0.1:9/?state=abc&code=good\n');
+  assert.equal(await w.code, 'good');
+  assert.equal(invalid.length, 1);
+  input = new PassThrough();
+  w = waitForPastedCode({ input, expectedState: 'abc' });
+  input.write('http://127.0.0.1:9/?state=zzz&code=bad\n');
+  await assert.rejects(w.code, /state mismatch/);
+});
+
+test('loopback server can be closed early', async () => {
+  const s = await startLoopbackServer({ expectedState: 'abc' });
+  s.close();
+  await assert.rejects(fetch(`${s.redirectUri}/?state=abc&code=x`));
 });

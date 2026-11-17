@@ -72,7 +72,7 @@ export async function sendHeartbeat({
       }
       if (res.status >= 400 && res.status < 500 && res.status !== 429) {
         // e.g. 404 = unknown check UUID: retrying will not help
-        logger.warn('heartbeat rejected; check monitoring.heartbeatUrl', { target, status: res.status });
+        logger.warn('heartbeat rejected; check HEALTHCHECK_URL', { target, status: res.status });
         return { sent: false, reason: `http ${res.status}` };
       }
       logger.warn('heartbeat attempt failed', { target, attempt, status: res.status });

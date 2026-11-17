@@ -1,8 +1,8 @@
 # Windows packaging plan (phase B)
 
-Status: **planned, not implemented.** This file records the decisions made so far for turning
-backup-manager into a Windows-only product that is easy to install. The implementation prompt
-(the `/feature` draft) was **not yet approved** when this was written. See *Open questions*.
+Status: **implemented** on branch `feat/windows-packaging`. This file records the decisions behind the Windows-only
+product. The user-facing documentation is in the README and [RESTORE.md](../RESTORE.md); where they differ from this
+plan, see *Implementation notes*.
 
 Builds on branch `chore/node22-deps`: Node 22 LTS, `mssql@12`, `google-auth-library@11`, `node-cron@4`, 83 tests.
 
@@ -202,7 +202,6 @@ It recognizes these common problems:
 
 - This was already implemented on `feat/healthchecks-heartbeat`, with one check per client.
 - **Agreed settings: Period = 1 day, Grace = 4 days**, so an alert fires after 5 days with no successful backup.
-  This needs confirming; see *Open questions*.
 - The URL is set with `HEALTHCHECK_URL` in the env file. A ping is sent only when every database succeeded.
 
 ## Releases and CI (GitHub Actions)
@@ -225,12 +224,33 @@ It recognizes these common problems:
 - Code signing of the scripts and `node.exe` wrapper, a GUI, Windows Server support, Windows Event Log integration,
   and several SQL Server instances per machine.
 
-## Open questions (resolve before implementing)
+## Resolved questions
 
-1. **Healthchecks grace period.** This conversation agreed on Period 1 day / Grace 4 days (5 days of silence).
-   A later request mentioned **"1d/2h"** (1 day / 2 hours grace). Which one applies?
-2. **`RESTORE.md`.** It was mentioned in a later request but never discussed. Should it be a client-facing or team
-   runbook for restoring from Drive with `download` plus `RESTORE DATABASE`, and is it part of phase B?
-3. **"Also include" list.** The user referred to an "Also include" list that is not in this conversation. Its
-   contents are unknown.
-4. **Approval.** The phase-B `/feature` prompt was drafted but not yet approved.
+1. **Healthchecks grace period:** Period 1 day / Grace 4 days (alert after 5 days of silence).
+2. **`RESTORE.md`:** yes, as a **team runbook** (download + manual `RESTORE DATABASE`), part of phase B.
+3. **"Also include" list:** dropped.
+4. **Approval:** the phase-B prompt was approved and implemented.
+
+## Implementation notes
+
+Details decided during implementation that the plan above did not spell out:
+
+- **Named instance vs. port.** The template pre-fills `SQL_PORT=1433`. With `SQL_INSTANCE` set, the instance is found
+  through SQL Browser unless `SQL_PORT` is set to something other than 1433 (then that port is used directly).
+- **Extra optional keys** (not in the template): `SQL_ENCRYPT`, `SQL_TRUST_SERVER_CERTIFICATE` (SQL Express uses a
+  self-signed certificate; `check` suggests this when the TLS handshake fails) and `LOG_LEVEL`.
+- **Strict env file.** Unknown keys are errors (typos), and an unquoted value containing `#` is rejected because
+  `util.parseEnv` would silently cut it there (passwords). A UTF-8 BOM is stripped.
+- **`check --skip-auth`.** Step 7 of the installer runs before the first Google sign-in (step 8), so the installer
+  skips the Google check there. `check` also verifies SQL Server is 2016+ and that the work folder is writable, and
+  fails if the signed-in account differs from `GOOGLE_EMAIL`.
+- **Paste fallback.** A pasted address is state-checked. A pasted bare code has no state to check; it is still bound to
+  this login by PKCE and the loopback `redirect_uri`.
+- **Installer extras:** `-RestoreOnly` (no task, no backup: for restore machines, see RESTORE.md); `-ZipPath` for offline installs (with the `.sha256` next to it); refuses to update while the
+  task is running; asks the technician to type `SAVED` after the key is shown; waits for Enter after Notepad (Windows
+  11 Notepad can return immediately); ACLs use SIDs so they work on any Windows language; the data folder is locked
+  before any secret is written to it.
+- **Build:** `scripts/build-package.js` uses `adm-zip` (dev dependency only) to read the Node zip and write the
+  release zip on both Windows and Linux. The bundled Node version is the one running the build (must be 22.x), or
+  `NODE_DIST_VERSION`.
+- **Log file dates** use the machine's local date.

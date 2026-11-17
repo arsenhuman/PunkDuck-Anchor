@@ -2,51 +2,86 @@ import crypto from 'node:crypto';
 import { parseArgs } from 'node:util';
 import * as auth from './auth.js';
 import { downloadBackup, listBackups, runBackups } from './backup.js';
-import { DEFAULT_CONFIG_PATH, loadConfig } from './config.js';
+import { formatChecks, runChecks } from './check.js';
+import { loadConfig } from './config.js';
 import { DriveStore } from './drive.js';
+import { loadEnvConfig, loadOAuthClient } from './envconfig.js';
 import { fmtBytes } from './format.js';
 import { sendHeartbeat } from './heartbeat.js';
-import { createLogger } from './logger.js';
+import { cleanupLogs, createLogger } from './logger.js';
 import { MssqlClient } from './mssql.js';
-import { startScheduler } from './scheduler.js';
+import { appPaths } from './paths.js';
+
+export const LOG_KEEP_DAYS = 30;
 
 export const USAGE = `Usage: backup-manager <command> [options]
 
 Commands:
-  auth login [--email you@gmail.com]   Connect a Google account (OAuth, opens consent URL)
+  check                                Verify settings, SQL Server, backup folder and Google sign-in
+  auth login [--email you@gmail.com]   Connect a Google account (prints a sign-in URL)
   auth status                          Show the connected Google account
-  auth logout                          Revoke and delete the stored token
-  backup [--server S] [--db D]         Back up configured databases now
-  list [--server S] [--db D]           List backups stored on Google Drive
+  auth logout                          Revoke and delete the stored Google sign-in
+  backup [--db D]                      Back up the configured databases now
+  list [--db D]                        List backups stored on Google Drive
   download <fileId> [--out DIR] [--force]
                                        Download + decrypt + decompress a backup to .bak
-  download latest --db D [--server S] [--out DIR] [--force]
-  schedule                             Run backups on the configured cron schedule
+  download latest --db D [--out DIR] [--force]
   keygen                               Print a new random encryption key (base64)
 
+Settings are read from backup-manager.env in the data folder
+(C:\\ProgramData\\backup-manager, or BACKUP_MANAGER_HOME).
+
 Options:
-  -c, --config PATH   Config file (default ${DEFAULT_CONFIG_PATH})
   -h, --help          Show this help
 `;
 
 const OPTIONS = {
-  config: { type: 'string', short: 'c', default: DEFAULT_CONFIG_PATH },
+  config: { type: 'string', short: 'c' }, // internal: JSON config instead of the env file
   server: { type: 'string' },
   db: { type: 'string' },
   out: { type: 'string', default: '.' },
   email: { type: 'string' },
   json: { type: 'boolean', default: false },
   force: { type: 'boolean', default: false },
+  'skip-auth': { type: 'boolean', default: false }, // check: used by install.ps1 before the first sign-in
   help: { type: 'boolean', short: 'h', default: false },
 };
+
+const COMMANDS = ['check', 'auth', 'backup', 'list', 'download', 'keygen'];
+
+const LOGIN_HELP = `
+No browser on this machine? Open the URL on your own computer and approve access.
+Your browser then fails to load a page at http://127.0.0.1:... - that is expected.
+Copy that full address from the address bar, paste it here and press Enter.`;
+
+/** Exit code 1 when the local token was removed but revoking it at Google failed. */
+async function logoutCommand(google, out) {
+  const r = await auth.logout(google);
+  if (!r.removed) {
+    out('Not logged in.');
+    return 0;
+  }
+  out(r.revoked ? 'Logged out (token revoked).' : 'Local token removed, but revoking it at Google failed.');
+  return r.revoked ? 0 : 1;
+}
 
 async function makeDrive(config, logger) {
   const client = await auth.getAuthorizedClient(config.google);
   return new DriveStore({ request: (o) => client.request(o), logger });
 }
 
-/** Returns the process exit code. */
-export async function main(argv, { stdout = process.stdout, logger = createLogger() } = {}) {
+/**
+ * Returns the process exit code.
+ * Injectable for tests: stdout, stdin, logger, env (for BACKUP_MANAGER_HOME), createSqlClient, authStatus.
+ */
+export async function main(argv, {
+  stdout = process.stdout,
+  stdin = process.stdin,
+  logger: injectedLogger,
+  env = process.env,
+  createSqlClient = (s) => new MssqlClient(s),
+  authStatus = auth.status,
+} = {}) {
   let parsed;
   try {
     parsed = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true });
@@ -63,23 +98,75 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
   const out = (s) => stdout.write(s + '\n');
   const filter = { server: opts.server, db: opts.db };
 
+  if (!COMMANDS.includes(cmd)) {
+    out(`Unknown command: ${cmd}\n\n${USAGE}`);
+    return 2;
+  }
+
   if (cmd === 'keygen') {
     out(crypto.randomBytes(32).toString('base64'));
     return 0;
   }
 
-  const config = await loadConfig(opts.config);
+  const paths = appPaths({ env });
+  const load = () => (opts.config ? loadConfig(opts.config) : loadEnvConfig(paths));
 
+  if (cmd === 'check') {
+    const { ok, checks } = await runChecks({
+      loadConfig: load, createSqlClient, authStatus, skipAuth: opts['skip-auth'], envFile: paths.envFile,
+    });
+    out(formatChecks(checks));
+    out(ok ? '\nAll checks passed.' : '\nSome checks failed. Fix the problems above and run "backup-manager check" again.');
+    return ok ? 0 : 1;
+  }
+
+  // Logout must work even with a broken env file (uninstall.ps1 -Purge): it needs only the token and OAuth client.
+  if (cmd === 'auth' && sub === 'logout' && !opts.config) {
+    const google = { ...(await loadOAuthClient(paths.oauthClientFile)), tokenFile: paths.tokenFile };
+    return logoutCommand(google, out);
+  }
+
+  // Settings errors and command failures also go to the log file: for runs started by Task Scheduler
+  // the log is the only record.
+  const logDir = opts.config ? undefined : paths.logDir;
+  let config;
+  try {
+    config = await load();
+  } catch (err) {
+    (injectedLogger ?? createLogger({ logDir, level: env.LOG_LEVEL ?? 'info' })).error('cannot load settings', { command: cmd, error: err });
+    throw err;
+  }
+  let logger = injectedLogger;
+  if (!logger) {
+    logger = createLogger({ logDir: config.logDir, level: config.logLevel ?? env.LOG_LEVEL ?? 'info' });
+    if (config.logDir) {
+      const deleted = cleanupLogs(config.logDir, { keepDays: LOG_KEEP_DAYS });
+      if (deleted.length) logger.info('old log files deleted', { count: deleted.length });
+    }
+  }
+
+  try {
+    return await dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient });
+  } catch (err) {
+    logger.error(`${cmd} failed`, { error: err });
+    throw err;
+  }
+}
+
+async function dispatch({ cmd, sub, opts, config, logger, out, filter, stdin, createSqlClient }) {
   switch (cmd) {
     case 'auth': {
       if (sub === 'login') {
+        const wanted = opts.email ?? config.googleEmail;
         const email = await auth.login(config.google, {
-          loginHint: opts.email,
-          prompt: (url) => out(`Open this URL in a browser and approve access:\n\n  ${url}\n\nWaiting for authorization...`),
+          loginHint: wanted,
+          input: stdin,
+          prompt: (url) => out(`Open this URL in a browser and approve access${wanted ? ` as ${wanted}` : ''}:\n\n  ${url}\n${LOGIN_HELP}\n\nWaiting for authorization...`),
+          onInvalidPaste: (err) => out(`That did not work (${err.message}). Paste the full http://127.0.0.1:... address and press Enter.`),
         });
         out(`Connected Google account: ${email}`);
-        if (opts.email && email && email.toLowerCase() !== opts.email.toLowerCase()) {
-          out(`Warning: you signed in as ${email}, not ${opts.email}.`);
+        if (wanted && email && email.toLowerCase() !== wanted.toLowerCase()) {
+          out(`Warning: you signed in as ${email}, not ${wanted}.`);
         }
         return 0;
       }
@@ -88,11 +175,7 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
         out(s.loggedIn ? `Logged in as ${s.email} (token: ${s.tokenFile})` : 'Not logged in.');
         return s.loggedIn ? 0 : 1;
       }
-      if (sub === 'logout') {
-        const r = await auth.logout(config.google);
-        out(r.removed ? `Logged out${r.revoked ? ' (token revoked)' : ' (local token removed; revoke failed)'}.` : 'Not logged in.');
-        return 0;
-      }
+      if (sub === 'logout') return logoutCommand(config.google, out);
       out(`Unknown auth subcommand: ${sub ?? '(none)'}\n\n${USAGE}`);
       return 2;
     }
@@ -100,8 +183,9 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
     case 'backup': {
       const drive = await makeDrive(config, logger);
       const { results, failed } = await runBackups({
-        config, drive, logger, filter, createSqlClient: (s) => new MssqlClient(s),
+        config, drive, logger, filter, createSqlClient,
       });
+      logger.info('backup run finished', { total: results.length, failed });
       if (opts.json) out(JSON.stringify(results, null, 2));
       else for (const r of results) {
         out(r.ok
@@ -130,33 +214,6 @@ export async function main(argv, { stdout = process.stdout, logger = createLogge
       const latest = sub === 'latest';
       const r = await downloadBackup({ config, drive, logger, filter, latest, fileId: latest ? undefined : sub, outDir: opts.out, force: opts.force });
       out(`Saved ${r.dest}`);
-      return 0;
-    }
-
-    case 'schedule': {
-      if (!config.schedule) {
-        out('No "schedule" section in config.');
-        return 2;
-      }
-      await auth.getAuthorizedClient(config.google); // fail fast if not logged in
-      const scheduler = startScheduler({
-        schedule: config.schedule,
-        logger,
-        job: async () => {
-          const drive = await makeDrive(config, logger);
-          const { results, failed } = await runBackups({ config, drive, logger, createSqlClient: (s) => new MssqlClient(s) });
-          logger.info('scheduled run finished', { total: results.length, failed });
-          await sendHeartbeat({ url: config.monitoring.heartbeatUrl, results, failed, logger });
-        },
-      });
-      await new Promise((resolve) => {
-        const shutdown = (sig) => {
-          logger.info('shutting down, waiting for running backup to finish', { signal: sig });
-          scheduler.stop().then(resolve);
-        };
-        process.once('SIGINT', shutdown);
-        process.once('SIGTERM', shutdown);
-      });
       return 0;
     }
 

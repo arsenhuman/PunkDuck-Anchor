@@ -15,6 +15,15 @@ export function buildVerifySql() {
 
 export const DB_EXISTS_SQL = 'SELECT state_desc FROM sys.databases WHERE name = @db;';
 
+export const BACKUP_PERMISSION_SQL = "SELECT HAS_PERMS_BY_NAME(@db, 'DATABASE', 'BACKUP DATABASE') AS can_backup;";
+
+export const SERVER_INFO_SQL = `SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS major,
+  CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS version,
+  CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition;`;
+
+/** SQL Server 2016 is major version 13. */
+export const MIN_SQL_MAJOR = 13;
+
 export function toPoolConfig(server) {
   return {
     server: server.host,
@@ -62,6 +71,18 @@ export class MssqlClient {
     const row = r.recordset?.[0];
     if (!row) throw new Error(`database "${db}" does not exist`);
     if (row.state_desc !== 'ONLINE') throw new Error(`database "${db}" is ${row.state_desc}, not ONLINE`);
+  }
+
+  /** True if the login may run BACKUP DATABASE on db. */
+  async canBackup(db) {
+    const r = await this.pool.request().input('db', this.driver.NVarChar(128), db).query(BACKUP_PERMISSION_SQL);
+    return r.recordset?.[0]?.can_backup === 1;
+  }
+
+  /** { major, version, edition } */
+  async serverInfo() {
+    const r = await this.pool.request().query(SERVER_INFO_SQL);
+    return r.recordset?.[0] ?? {};
   }
 
   async backup(db, serverPath) {
