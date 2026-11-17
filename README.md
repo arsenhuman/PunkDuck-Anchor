@@ -278,8 +278,10 @@ reading every file first. Everything above it describes how to *use* the tool.
   - `mssql`, the SQL Server driver (tedious).
   - `google-auth-library`, for OAuth and authorized HTTP requests.
   - The Drive API is called over **raw REST**. The project does not use `googleapis`.
-- **Tests:** `npm test` runs `node --test "test/*.test.js"`. The pattern is quoted so Node expands it, which also works in Windows `cmd`. Nothing in the tests touches a real SQL Server, Google or the network,
-  except a loopback HTTP server on 127.0.0.1.
+- **Tests:** `npm test` runs `node --test "test/*.test.js"`. The pattern is quoted so Node expands it, which also works in Windows `cmd`. Nothing in the tests touches a real SQL Server or Google data,
+  and the only network use is a loopback HTTP server on 127.0.0.1, with one exception: the logout tests
+  (`test/auth.test.js`, `test/cli.test.js`) call Google's token-revoke endpoint with a fake token. They pass whether
+  Google rejects the token or the network is unreachable.
 - **Design rule:** I/O is **injected**. The orchestration in `src/backup.js` receives `drive`, `createSqlClient`,
   `logger` and `now` as parameters, which is what makes it unit-testable.
 
@@ -475,7 +477,7 @@ Development happens on Linux with Node 22.
 
 ```bash
 npm install
-npm test                         # all unit tests (no network, no SQL Server)
+npm test                         # all unit tests (no SQL Server; only the logout tests reach Google's revoke endpoint)
 node --test test/drive.test.js   # a single file
 
 # run against a local env file instead of C:\ProgramData

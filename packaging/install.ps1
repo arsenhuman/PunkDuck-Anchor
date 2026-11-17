@@ -121,7 +121,7 @@ function Get-Package {
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
     if ($ZipPath) {
-        $zip = (Resolve-Path $ZipPath).Path
+        $zip = $ZipPath   # already resolved to a full path at startup
         $shaFile = "$zip.sha256"
         if (-not (Test-Path $shaFile)) { throw "Missing $shaFile next to the zip." }
     } else {
@@ -277,6 +277,15 @@ function Install-BackupManager {
     Write-Host "  Settings: $EnvFile"
     Write-Host "  Logs:     $LogDir"
     Write-Host "  Check:    & '$Launcher' check"
+}
+
+# Resolve -ZipPath against the technician's folder before the working directory changes.
+if ($ZipPath) {
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+        Write-Host "INSTALL STOPPED: zip not found: $ZipPath" -ForegroundColor Red
+        if ($PSCommandPath) { exit 1 } else { return }
+    }
+    $ZipPath = (Resolve-Path -LiteralPath $ZipPath).Path
 }
 
 Push-Location $env:SystemRoot   # never sit inside the folder we replace
