@@ -87,7 +87,9 @@ A release is public and immediately becomes "latest", which is what `irm ... | i
 a Windows VM first; to fix a bad release, publish the next patch version.
 
 `.github/workflows/ci.yml` runs `npm ci` + `npm test` on `windows-latest` and `ubuntu-latest` for every push and
-pull request, and makes Windows PowerShell 5.1 parse the `.ps1` scripts.
+pull request. On Windows it also makes Windows PowerShell 5.1 parse the `.ps1` scripts (and checks they are pure
+ASCII), and runs `test/install-functions.ps1`: the pure functions of `install.ps1` and the rule that its T-SQL is
+constant text.
 
 ### Healthchecks.io (per client)
 
