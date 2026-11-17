@@ -1,10 +1,17 @@
 // Google OAuth 2.0 for installed apps: loopback redirect + PKCE + state.
-// Only the refresh token (and metadata) is persisted, in a 0600 file.
+// Only the refresh token (and metadata) is persisted, in a 0600 file (on Windows the
+// data folder is locked down with icacls by install.ps1).
+//
+// Remote fallback for machines without a usable browser: the technician opens the URL on
+// their own laptop, and pastes the final http://127.0.0.1:... address (or just the code)
+// into the console. A pasted URL must carry the right state; the code is always redeemed
+// with our PKCE verifier and loopback redirect_uri, so a code from another flow is useless.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
+import readline from 'node:readline';
 import { OAuth2Client, CodeChallengeMethod } from 'google-auth-library';
 
 export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
@@ -65,6 +72,77 @@ export async function fetchAccountEmail(request) {
   return res.data?.user?.emailAddress;
 }
 
+function stateMatches(got, expected) {
+  const a = Buffer.from(got || '');
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Turn what the technician pasted into an authorization code.
+ * Accepts the full redirect address (state is checked) or the bare code.
+ */
+export function parsePastedRedirect(text, expectedState) {
+  const t = String(text ?? '').trim().replace(/^["']|["']$/g, '');
+  if (!t) throw new AuthError('nothing was pasted');
+  if (/^https?:\/\//i.test(t) || t.includes('?') || t.includes('&')) {
+    let url;
+    try {
+      url = new URL(t.includes('://') ? t : `http://127.0.0.1/${t.startsWith('?') ? t : `?${t}`}`);
+    } catch {
+      throw new AuthError('the pasted address is not a valid URL');
+    }
+    const p = url.searchParams;
+    if (p.get('error')) throw new AuthError(`authorization denied: ${p.get('error')}`);
+    if (!stateMatches(p.get('state'), expectedState)) {
+      throw new AuthError('OAuth state mismatch; login aborted (paste the address from THIS login attempt)');
+    }
+    const code = p.get('code');
+    if (!code) throw new AuthError('the pasted address contains no code');
+    return code;
+  }
+  if (!/^[\w\-./~%]+$/.test(t)) throw new AuthError('the pasted text is neither a URL nor an authorization code');
+  return decodeURIComponent(t);
+}
+
+/**
+ * Read pasted lines from `input` until one parses. Returns { code, close }.
+ * Invalid pastes are reported through onInvalid and the user may try again,
+ * except a state mismatch, which aborts.
+ */
+export function waitForPastedCode({ input, expectedState, onInvalid = () => {} }) {
+  const rl = readline.createInterface({ input, terminal: false });
+  let done = false;
+  const code = new Promise((resolve, reject) => {
+    rl.on('line', (line) => {
+      if (done || !line.trim()) return;
+      try {
+        const c = parsePastedRedirect(line, expectedState);
+        done = true;
+        rl.close();
+        resolve(c);
+      } catch (err) {
+        if (/state mismatch|denied/.test(err.message)) {
+          done = true;
+          rl.close();
+          reject(err);
+        } else onInvalid(err);
+      }
+    });
+    // If input ends (e.g. not a console) we simply stop listening: the loopback flow may still finish.
+    rl.on('close', () => {
+      done = true;
+    });
+  });
+  return {
+    code,
+    close: () => {
+      done = true;
+      rl.close();
+    },
+  };
+}
+
 /** Wait for Google's redirect on a random loopback port; resolves with the auth code. */
 export function startLoopbackServer({ expectedState, timeoutMs = LOGIN_TIMEOUT_MS }) {
   return new Promise((resolveServer, rejectServer) => {
@@ -84,9 +162,7 @@ export function startLoopbackServer({ expectedState, timeoutMs = LOGIN_TIMEOUT_M
         server.close();
         outcome();
       };
-      const got = Buffer.from(url.searchParams.get('state') || '');
-      const want = Buffer.from(expectedState);
-      const stateOk = got.length === want.length && crypto.timingSafeEqual(got, want);
+      const stateOk = stateMatches(url.searchParams.get('state'), expectedState);
       if (!stateOk) {
         return finish(400, 'Invalid state. You can close this window.', () =>
           settle.reject(new AuthError('OAuth state mismatch; login aborted')));
@@ -112,18 +188,26 @@ export function startLoopbackServer({ expectedState, timeoutMs = LOGIN_TIMEOUT_M
     server.on('error', rejectServer);
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
-      resolveServer({ redirectUri: `http://127.0.0.1:${port}`, code: codePromise });
+      const close = () => {
+        clearTimeout(timer);
+        server.close();
+        server.closeAllConnections?.();
+      };
+      resolveServer({ redirectUri: `http://127.0.0.1:${port}`, code: codePromise, close });
     });
   });
 }
 
 /**
  * Interactive login. `prompt(url)` shows the consent URL to the user.
+ * With `input` (a readable stream, normally stdin) the user may also paste the redirect
+ * address or code; whichever arrives first (loopback or paste) wins.
  * Returns the connected email address.
  */
-export async function login(google, { prompt, loginHint } = {}) {
+export async function login(google, { prompt, loginHint, input, onInvalidPaste, timeoutMs } = {}) {
   const state = crypto.randomBytes(24).toString('base64url');
-  const { redirectUri, code } = await startLoopbackServer({ expectedState: state });
+  const loopback = await startLoopbackServer({ expectedState: state, timeoutMs });
+  const { redirectUri } = loopback;
   const client = newClient(google, redirectUri);
   const { codeVerifier, codeChallenge } = await client.generateCodeVerifierAsync();
   const url = client.generateAuthUrl({
@@ -136,7 +220,17 @@ export async function login(google, { prompt, loginHint } = {}) {
     login_hint: loginHint,
   });
   prompt(url);
-  const { tokens } = await client.getToken({ code: await code, codeVerifier, redirect_uri: redirectUri });
+  const paste = input ? waitForPastedCode({ input, expectedState: state, onInvalid: onInvalidPaste }) : null;
+  let code;
+  try {
+    code = await (paste ? Promise.race([loopback.code, paste.code]) : loopback.code);
+  } finally {
+    loopback.close();
+    paste?.close();
+    loopback.code.catch(() => {});
+    paste?.code.catch(() => {});
+  }
+  const { tokens } = await client.getToken({ code, codeVerifier, redirect_uri: redirectUri });
   if (!tokens.refresh_token) throw new AuthError('Google did not return a refresh token');
   client.setCredentials(tokens);
   const email = await fetchAccountEmail((o) => client.request(o));

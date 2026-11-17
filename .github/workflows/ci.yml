@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+      # The .ps1 scripts cannot run in CI (they need Administrator, Task Scheduler and a real SQL Server),
+      # but Windows PowerShell 5.1 must at least parse them, and they must stay pure ASCII.
+      - name: Parse PowerShell scripts with Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem packaging\*.ps1) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+            if ([IO.File]::ReadAllBytes($f.FullName) | Where-Object { $_ -gt 127 }) { Write-Host "$($f.Name): non-ASCII characters"; $failed = $true }
+          }
+          if ($failed) { exit 1 }

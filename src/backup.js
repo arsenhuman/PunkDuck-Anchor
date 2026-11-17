@@ -58,7 +58,7 @@ export async function backupOne({ config, server, db, sqlClient, drive, logger, 
       await fs.access(localBak);
     } catch {
       throw new Error(
-        `backup file not found at ${localBak}; check that servers[].localBackupDir points to the same directory as backupDir`,
+        `backup file not found at ${localBak}; SQL Server must run on this machine and SQL_BACKUP_DIR (localBackupDir) must be the folder it writes backups to`,
       );
     }
 

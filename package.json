@@ -7,22 +7,19 @@
     "backup-manager": "bin/backup-manager.js"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=22.12"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test \"test/*.test.js\"",
+    "build:package": "node scripts/build-package.js"
   },
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
-    "google-auth-library": "^9.15.1",
-    "mssql": "^10.0.5",
-    "node-cron": "^4.6.0"
+    "google-auth-library": "^11.3.4",
+    "mssql": "^12.7.14"
   },
-  "overrides": {
-    "@typespec/ts-http-runtime": {
-      "https-proxy-agent": "^7.0.6",
-      "http-proxy-agent": "^7.0.2"
-    }
+  "devDependencies": {
+    "adm-zip": "0.6.1"
   }
 }

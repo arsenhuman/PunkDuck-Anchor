@@ -27,3 +27,93 @@ test('keygen prints a 32-byte base64 key', async () => {
 test('missing config file is an error', async () => {
   await assert.rejects(main(['list', '-c', '/nonexistent/x.json'], { stdout: capture().stdout, logger: silentLogger }), /cannot read config/);
 });
+
+test('schedule command is gone (Task Scheduler runs "backup")', async () => {
+  const c = capture();
+  assert.equal(await main(['schedule'], { stdout: c.stdout, logger: silentLogger, env: { BACKUP_MANAGER_HOME: '/nonexistent' } }), 2);
+  assert.match(c.text, /Unknown command: schedule/);
+  assert.doesNotMatch(c.text.split('Usage')[1], /schedule/);
+});
+
+async function home() {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const { tmpDir } = await import('./helpers.js');
+  const dir = await tmpDir();
+  const bak = path.join(dir, 'bak');
+  await fs.mkdir(bak);
+  await fs.writeFile(path.join(dir, 'oauth.json'), JSON.stringify({ installed: { client_id: 'i', client_secret: 's' } }));
+  const env = { BACKUP_MANAGER_HOME: dir, BACKUP_MANAGER_OAUTH_CLIENT: path.join(dir, 'oauth.json') };
+  const writeEnv = (extra = '') => fs.writeFile(path.join(dir, 'backup-manager.env'),
+    `SQL_USER=u\r\nSQL_PASSWORD=p\r\nSQL_DATABASES=Sales\r\nSQL_BACKUP_DIR=${bak}\r\nBACKUP_ENCRYPTION_KEY=${Buffer.alloc(32, 1).toString('base64')}\r\n${extra}`);
+  return { dir, env, writeEnv };
+}
+
+const okSql = () => ({
+  async connect() {}, async close() {}, async serverInfo() { return { major: 15, version: '15.0', edition: 'Express Edition' }; },
+  async assertDatabaseOnline() {}, async canBackup() { return true; },
+});
+
+test('check reads the env file from BACKUP_MANAGER_HOME and exits 0 only when all pass', async () => {
+  const h = await home();
+  let c = capture();
+  assert.equal(await main(['check'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 1);
+  assert.match(c.text, /\[FAIL\] Settings: cannot read .*backup-manager\.env/);
+
+  await h.writeEnv();
+  c = capture();
+  assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 0, c.text);
+  assert.match(c.text, /All checks passed/);
+
+  c = capture();
+  const authStatus = async () => ({ loggedIn: false });
+  assert.equal(await main(['check'], { stdout: c.stdout, env: h.env, createSqlClient: okSql, authStatus }), 1);
+  assert.match(c.text, /not signed in/);
+
+  await h.writeEnv('SQL_DATABASES2=x\r\n');
+  c = capture();
+  assert.equal(await main(['check'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 1);
+  assert.match(c.text, /unknown setting SQL_DATABASES2/);
+});
+
+test('commands log to the daily file in the data folder', async () => {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const h = await home();
+  await h.writeEnv();
+  await fs.mkdir(path.join(h.dir, 'logs'));
+  await fs.writeFile(path.join(h.dir, 'logs', 'backup-2000-01-01.log'), '');
+  // `list` fails (not signed in) after the logger is set up and old logs are cleaned.
+  await assert.rejects(main(['list'], { stdout: capture().stdout, env: h.env }), /auth login/);
+  const files = await fs.readdir(path.join(h.dir, 'logs'));
+  assert.ok(!files.includes('backup-2000-01-01.log'), 'old log removed');
+  const log = await fs.readFile(path.join(h.dir, 'logs', files[0]), 'utf8');
+  assert.match(log, /old log files deleted/);
+  assert.match(log, /"msg":"list failed".*auth login/);
+});
+
+test('a broken env file is recorded in the log file too', async () => {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const h = await home();
+  await h.writeEnv('KEEP_LAST=zero\r\n');
+  await assert.rejects(main(['backup'], { stdout: capture().stdout, env: h.env }), /KEEP_LAST must be a positive whole number/);
+  const [file] = await fs.readdir(path.join(h.dir, 'logs'));
+  assert.match(await fs.readFile(path.join(h.dir, 'logs', file), 'utf8'), /cannot load settings.*KEEP_LAST/);
+});
+
+test('auth logout works even when the env file is broken', async () => {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const h = await home();
+  await h.writeEnv('SQL_DATABASES2=typo\r\n');
+  let c = capture();
+  assert.equal(await main(['auth', 'logout'], { stdout: c.stdout, env: h.env }), 0);
+  assert.match(c.text, /Not logged in/);
+  await fs.writeFile(path.join(h.dir, 'token.json'), JSON.stringify({ refresh_token: 'fake' }));
+  c = capture();
+  // revoke of a fake token fails (or there is no network): exit 1 so uninstall.ps1 can warn
+  assert.equal(await main(['auth', 'logout'], { stdout: c.stdout, env: h.env }), 1);
+  assert.match(c.text, /revoking it at Google failed/);
+  await assert.rejects(fs.access(path.join(h.dir, 'token.json')));
+});

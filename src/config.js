@@ -9,7 +9,6 @@ export class ConfigError extends Error {
   }
 }
 
-export const DEFAULT_CONFIG_PATH = './backup-manager.json';
 const DB_NAME_RE = /^[^\x00-\x1f\]\[]{1,128}$/;
 const SERVER_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -51,9 +50,9 @@ function bool(value, name, dflt) {
 }
 
 /** Validate and apply defaults. Returns a new, normalized config object. */
-export function normalizeConfig(raw, { env = process.env } = {}) {
+export function normalizeConfig(raw, { env = process.env, resolveRefs = true } = {}) {
   req(raw && typeof raw === 'object' && !Array.isArray(raw), 'config must be a JSON object');
-  const c = resolveEnvRefs(raw, env);
+  const c = resolveRefs ? resolveEnvRefs(raw, env) : raw;
 
   // google
   req(c.google && typeof c.google === 'object', 'google section is required');
@@ -122,11 +121,23 @@ export function normalizeConfig(raw, { env = process.env } = {}) {
     encryption.key = parseEncryptionKey(env[encryption.keyEnv], encryption.keyEnv);
   }
 
-  // schedule
-  let schedule;
-  if (c.schedule !== undefined) {
-    req(c.schedule && typeof c.schedule.cron === 'string' && c.schedule.cron.trim(), 'schedule.cron is required');
-    schedule = { cron: c.schedule.cron, timezone: c.schedule.timezone };
+  // monitoring (optional Healthchecks.io heartbeat)
+  const monitoring = { heartbeatUrl: undefined };
+  if (c.monitoring !== undefined) {
+    req(c.monitoring && typeof c.monitoring === 'object' && !Array.isArray(c.monitoring), 'monitoring must be an object');
+    const u = c.monitoring.heartbeatUrl;
+    if (u !== undefined && u !== '') {
+      let parsed;
+      try {
+        parsed = new URL(u);
+      } catch {
+        parsed = null;
+      }
+      req(typeof u === 'string' && parsed && parsed.protocol === 'https:',
+        'monitoring.heartbeatUrl must be an https:// URL (e.g. https://hc-ping.com/<uuid>)');
+      req(!/REPLACE-WITH/i.test(u), 'monitoring.heartbeatUrl is still the example placeholder: paste your check\'s ping URL');
+      monitoring.heartbeatUrl = u;
+    }
   }
 
   return {
@@ -137,7 +148,7 @@ export function normalizeConfig(raw, { env = process.env } = {}) {
     compression: bool(c.compression, 'compression', true),
     encryption,
     workDir: path.resolve(expandHome(c.workDir || path.join(os.tmpdir(), 'backup-manager'))),
-    schedule,
+    monitoring,
   };
 }
 
@@ -151,7 +162,8 @@ export function parseEncryptionKey(value, envName = 'BACKUP_ENCRYPTION_KEY') {
   return key;
 }
 
-export async function loadConfig(configPath = DEFAULT_CONFIG_PATH, opts = {}) {
+/** Internal JSON config loader (development and tests; not documented for clients). */
+export async function loadConfig(configPath, opts = {}) {
   let text;
   try {
     text = await fs.readFile(configPath, 'utf8');

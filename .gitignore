@@ -7,3 +7,5 @@ token.json
 *.bak.gz.enc
 *.download
 *.partial
+dist/
+oauth-client.json
