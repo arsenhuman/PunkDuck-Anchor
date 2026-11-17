@@ -1,6 +1,7 @@
 # v0.1.1 plan: installer prepares SQL Server + P1 fixes
 
-Status: **approved 2026-11-18** (decisions in section 9). Branch: `feat/sql-setup`, PR into `main`.
+Status: **implemented 2026-11-18** (approved with the decisions in section 9). Branch: `feat/sql-setup`, PR into `main`.
+Manual testing on Windows (section 8) is still open.
 
 Goal: on a fresh SQL Server Express machine, the technician running `install.ps1` over RDP makes **one decision**
 (restart SQL Server now or later) instead of doing the SQL fixes by hand.
@@ -122,7 +123,8 @@ client's databases don't exist there yet. So:
 - In `-RestoreOnly` mode, step 7 prints "skipped (restore-only)", and steps 8 and 9 run
   `check --skip-auth --skip-sql` and `check --skip-sql`.
 - New **`check --skip-sql`** skips the SQL connection, the verify permission, the databases and the backup folder.
-  These rows show as `--` skipped. The settings, work folder, Google and Healthchecks rows are still checked.
+  As built, it shows two `--` rows, "SQL connection" and "Backup folder", and no per-database rows. The settings,
+  work folder, Google and Healthchecks rows are still checked.
 - **Needed for this to work (found while planning):** settings loading itself rejects an empty `SQL_PASSWORD`, which
   breaks `check --skip-sql`, `list` and `download` on a restore machine. So `SQL_PASSWORD` must be non-empty only for
   commands that use SQL: `backup`, and `check` without `--skip-sql`. `loadEnvConfig(paths, { requireSql })` handles

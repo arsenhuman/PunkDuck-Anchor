@@ -102,8 +102,13 @@ The ping is best-effort (10 s timeout, 3 attempts) and never changes the backup 
 
 ## Installing on a client machine (over RDP)
 
-Before you start, have ready: the SQL login (see *SQL Server preparation*), the client's Gmail address and password
-(or the client at hand to sign in), the Healthchecks ping URL, and access to the company password manager.
+Before you start, have ready:
+- a Windows account that is a **SQL Server sysadmin** (normally the account that installed SQL Server; otherwise see
+  *SQL Server preparation*);
+- a moment when a **~30 s SQL Server restart** is acceptable, in case mixed mode or TCP/IP still has to be enabled;
+- the client's Gmail address and password, or the client at hand to sign in;
+- the Healthchecks ping URL;
+- access to the company password manager.
 
 Open **Windows PowerShell as Administrator** and run:
 
@@ -122,30 +127,31 @@ Installer options (they need the `-File` form, not `irm | iex`):
 | --- | --- |
 | `-Version 1.2.0` | Install that release instead of the latest |
 | `-ZipPath .\backup-manager-1.2.0-win-x64.zip` | Offline install when GitHub is blocked: copy the zip **and** its `.sha256` into the same folder first |
-| `-RestoreOnly` | Restore machine for another client's backups: no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
+| `-RestoreOnly` | Restore machine for another client's backups: no SQL Server preparation or SQL checks, no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
+| `-SkipSqlSetup` | Don't touch SQL Server (the client's DBA manages it): the DBA runs `sql-prepare.sql` instead, see *SQL Server preparation* |
 
 The installer:
 
 1. Checks for Administrator rights and Windows 10/11 x64.
 2. Downloads the zip and its `.sha256` (or takes them from `-ZipPath`) and verifies the hash.
 3. Extracts to `C:\Program Files\backup-manager\` (only the program files are replaced).
-4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill it in,
-   save, close Notepad and press Enter.
+4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill it in
+   (leave `SQL_PASSWORD` and `BACKUP_ENCRYPTION_KEY` empty), save, close Notepad and press Enter.
 5. If `BACKUP_ENCRYPTION_KEY` is empty, generates a key, writes it into the env file and **shows it once**.
    **Store it in the company password manager** under the client, then type `SAVED`.
 6. Locks both folders down to SYSTEM and Administrators.
-7. Runs `backup-manager check` (without the Google part). On failure it stops with a plain-language explanation.
+7. **Prepares SQL Server** (see *SQL Server preparation*): SQL login, permissions, SQL Browser, and, only after you
+   type `RESTART`, mixed mode and TCP/IP.
+8. Runs `backup-manager check` (without the Google part). On failure it stops with a plain-language explanation.
    Fix the env file and run the installer again; re-running is safe.
-8. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*), then the full
+9. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*), then the full
    `check` again. It stops if the signed-in account is not `GOOGLE_EMAIL`.
-9. Registers or updates the scheduled task "PunkDuck Backup Manager": daily at `BACKUP_TIME`, as SYSTEM with highest
-   privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs.
-10. Runs the first backup and prints the result.
+10. Registers or updates the scheduled task "PunkDuck Backup Manager": daily at `BACKUP_TIME`, as SYSTEM with highest
+    privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs.
+11. Runs the first backup and prints the result.
 
-**On a stock SQL Server Express, the first `check` usually fails** on one of the traps in *SQL Server
-preparation*, most often the self-signed TLS certificate: add `SQL_TRUST_SERVER_CERTIFICATE=true` to the env file
-(`notepad C:\ProgramData\backup-manager\backup-manager.env` in the Administrator PowerShell) and run the
-installer again. It keeps what you already entered.
+Whenever it stops, fix what it says and run it again: it keeps what you already entered and redoes only what is
+still missing.
 
 **Update:** run the installer again. It keeps the env file, the key and the Google sign-in. It refuses to update
 while a backup is running.
@@ -163,37 +169,68 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninst
 
 ### SQL Server preparation
 
-Do this in SSMS, connected as an administrator, before running the installer:
+**The installer does this for you** (step 7), connected with your Windows account. It doesn't use TCP/IP or a SQL
+login for this, so it works on a brand-new SQL Server Express. Your account must be a SQL Server **sysadmin**.
 
-1. **Enable mixed-mode authentication** (Express often allows Windows logins only): server Properties > Security >
-   "SQL Server and Windows Authentication mode", then restart the SQL Server service. Without it the SQL login
-   below can't sign in.
-2. **Enable TCP/IP** in SQL Server Configuration Manager (see the table below) and restart the service.
-3. **Create a SQL login** for the program and give it backup rights on **each** database in `SQL_DATABASES`:
+What it does, all safe to repeat:
 
-```sql
-CREATE LOGIN backup_user WITH PASSWORD = '<strong password>';
-USE Sales;
-CREATE USER backup_user FOR LOGIN backup_user;
-ALTER ROLE db_backupoperator ADD MEMBER backup_user;
--- repeat USE / CREATE USER / ALTER ROLE for every other database
+1. Finds the SQL Server service from `SQL_INSTANCE` (`MSSQLSERVER` if empty, otherwise `MSSQL$<instance>`) and
+   starts it if it is stopped. It skips the whole step if `SQL_HOST` is not this machine.
+2. Checks that every database in `SQL_DATABASES` exists, is `ONLINE` and is writable, before it changes anything.
+3. **The login `SQL_USER`.** If `SQL_PASSWORD` is empty, it creates the login, or resets the password of an existing
+   one, with a random 32-character password and writes that into the env file. The password is never shown.
+   If `SQL_PASSWORD` is already set, the password is left alone. Either way the login is enabled, its default
+   database is `master`, and password expiry is turned off, so an expiry policy can't silently stop the nightly backups.
+4. **Permissions.** In `master`, a user with `CREATE DATABASE`: `RESTORE VERIFYONLY`, which checks every backup,
+   needs it, and `db_backupoperator` is not enough. In every database, a user in `db_backupoperator`. A user left
+   orphaned by a restore from another server is re-linked to the login.
+5. **SQL Server Browser** (named instance, `SQL_PORT` empty or 1433): set to Automatic and started.
+6. **Settings that need a SQL Server restart:** mixed-mode authentication, TCP/IP, and, for the default instance only,
+   a static TCP port (`SQL_PORT`, normally 1433). A named instance keeps its ports. If the default instance already
+   uses another static port, `SQL_PORT` is changed to match instead. **Firewall rules are never changed**: the
+   program connects locally.
+
+If anything in step 6 is needed, the installer lists it and asks:
+
+```
+Applying this RESTARTS the SQL Server service. Everyone using this SQL Server
+(the client's application too) is disconnected for about 30 seconds.
+Type RESTART to apply now, or press Enter to stop and run the installer again later:
 ```
 
-4. **Find the backup folder** for `SQL_BACKUP_DIR`: SSMS > server Properties > Database Settings > *Backup*. Default:
-   `C:\Program Files\Microsoft SQL Server\MSSQL<nn>.<INSTANCE>\MSSQL\Backup`, where `<nn>` is 13 for SQL Server
-   2016, 14 for 2017, 15 for 2019 and 16 for 2022, and `<INSTANCE>` is e.g. `SQLEXPRESS` (or `MSSQLSERVER` for a
-   default instance).
+- **Enter** stops the installer, and none of the step 6 settings are changed. (The login and permissions from
+  steps 3 to 5 are kept; they don't disturb anything.) Run the installer again when a restart is OK.
+- **`RESTART`** applies the settings, restarts SQL Server, starts SQL Server Agent and other services that depend
+  on it again, and waits until SQL Server accepts connections (up to 90 s).
 
-Common SQL Server Express traps, all detected by `backup-manager check`:
+It ends with a summary (login created/kept, databases, settings changed, restart or not). A second run finds
+nothing to change and does not ask again.
 
-| Problem | Fix |
-| --- | --- |
-| **TCP/IP is disabled** (Express default) | SQL Server Configuration Manager > SQL Server Network Configuration > Protocols > enable TCP/IP, restart the SQL Server service |
-| **SQL Browser stopped** with a named instance (`SQL_INSTANCE=SQLEXPRESS`) | Start the "SQL Server Browser" service (Automatic), or set `SQL_PORT` to the instance's fixed port |
-| **Mixed-mode authentication disabled** (Windows logins only) | SSMS > server Properties > Security > "SQL Server and Windows Authentication mode", restart |
-| **Login failed** | Wrong `SQL_USER`/`SQL_PASSWORD`, or the login is disabled |
-| **Self-signed TLS certificate** | Add `SQL_TRUST_SERVER_CERTIFICATE=true` (fine for a SQL Server on the same machine) |
-| **No backup compression on Express** | Nothing to do: native compression stays off and the program compresses with gzip |
+**When you are not a SQL Server sysadmin** (the client's DBA manages SQL Server), the installer stops at step 7 and
+names the account it used. Then:
+
+1. The DBA runs `C:\Program Files\backup-manager\sql-prepare.sql` in SSMS (it is commented; replace the login name,
+   password and database name first) and enables mixed mode and TCP/IP if needed.
+2. Put the password into `SQL_PASSWORD` in the env file.
+3. Run the installer again with **`-SkipSqlSetup`**.
+
+**`SQL_BACKUP_DIR`** is still yours to fill in: SSMS > server Properties > Database Settings > *Backup*. Default:
+`C:\Program Files\Microsoft SQL Server\MSSQL<nn>.<INSTANCE>\MSSQL\Backup`, where `<nn>` is 13 for SQL Server
+2016, 14 for 2017, 15 for 2019, 16 for 2022 and 17 for 2025, and `<INSTANCE>` is e.g. `SQLEXPRESS` (or
+`MSSQLSERVER` for a default instance).
+
+Common SQL Server traps, all detected by `backup-manager check`:
+
+| Problem | Fixed by the installer | Manual fix |
+| --- | --- | --- |
+| **TCP/IP is disabled** (default on new installs, especially Express) | Yes, after `RESTART` | SQL Server Configuration Manager > SQL Server Network Configuration > Protocols > enable TCP/IP, restart the SQL Server service |
+| **SQL Browser stopped** with a named instance (`SQL_INSTANCE=SQLEXPRESS`) | Yes | Start the "SQL Server Browser" service (Automatic), or set `SQL_PORT` to the instance's fixed port |
+| **Mixed-mode authentication disabled** (Windows logins only) | Yes, after `RESTART` | SSMS > server Properties > Security > "SQL Server and Windows Authentication mode", restart |
+| **Login failed** | Yes, if `SQL_PASSWORD` is empty | Wrong `SQL_USER`/`SQL_PASSWORD`, or the login is disabled |
+| **No verify permission** (Msg 262 + Msg 3013 "VERIFY DATABASE is terminating abnormally") | Yes | `GRANT CREATE DATABASE` in `master`, see `sql-prepare.sql` |
+| **No BACKUP permission** | Yes | `db_backupoperator` in each database, see `sql-prepare.sql` |
+| **Self-signed TLS certificate** | Not needed: trusted by default for a SQL Server on this machine | Remove `SQL_TRUST_SERVER_CERTIFICATE=false` from the env file |
+| **No backup compression on Express** | Not needed | Nothing to do: native compression stays off and the program compresses with gzip |
 
 ## Settings: `backup-manager.env`
 
@@ -206,6 +243,7 @@ SQL_PORT=1433
 # For a named instance such as SQLEXPRESS (needs the SQL Browser service, or set SQL_PORT instead):
 SQL_INSTANCE=
 SQL_USER=backup_user
+# Leave empty: the installer creates the login and fills this in
 SQL_PASSWORD=
 # Comma-separated
 SQL_DATABASES=Sales,HR
@@ -235,7 +273,7 @@ BACKUP_ENCRYPTION_KEY=
 | `SQL_HOST` | `localhost` | SQL Server host. It must run on this machine (the program reads the `.bak` from `SQL_BACKUP_DIR`) |
 | `SQL_PORT` | `1433` | TCP port. With `SQL_INSTANCE` set, a value other than 1433 means "connect to this port directly, skip SQL Browser" |
 | `SQL_INSTANCE` | (none) | Named instance, e.g. `SQLEXPRESS`. Found through the SQL Browser service |
-| `SQL_USER`, `SQL_PASSWORD` | required | SQL login |
+| `SQL_USER`, `SQL_PASSWORD` | `backup_user` / filled in by the installer | SQL login. Leave `SQL_PASSWORD` empty and the installer creates the login and writes the password here. A restore-only machine doesn't need it |
 | `SQL_DATABASES` | required | Comma-separated database names |
 | `SQL_BACKUP_DIR` | required | Folder SQL Server writes backups to |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
@@ -244,7 +282,7 @@ BACKUP_ENCRYPTION_KEY=
 | `KEEP_LAST` / `KEEP_DAYS` | (none) | Retention: a backup is kept if it is one of the newest `KEEP_LAST` **or** younger than `KEEP_DAYS`. The newest backup is never deleted. With neither set, nothing is deleted |
 | `HEALTHCHECK_URL` | (none: monitoring off) | Healthchecks.io ping URL, `https://` only |
 | `BACKUP_ENCRYPTION_KEY` | required | 32-byte key, base64 or hex. **Never change it** after the first backup; old backups need the old key |
-| `SQL_ENCRYPT` / `SQL_TRUST_SERVER_CERTIFICATE` | `true` / `false` | TLS to SQL Server (optional, not in the template) |
+| `SQL_ENCRYPT` / `SQL_TRUST_SERVER_CERTIFICATE` | `true` / `true` for a SQL Server on this machine, else `false` | TLS to SQL Server (optional, not in the template). "This machine" means `SQL_HOST` is `localhost`, `127.0.0.1`, `::1`, `.`, `(local)` or the computer name. A value in the env file always wins |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (optional) |
 
 Rules:
@@ -290,6 +328,7 @@ Run in an Administrator PowerShell, after `$bm = "C:\Program Files\backup-manage
 
 ```powershell
 & $bm check                                # verify settings, SQL Server, folder, Google; exit 0 only if all pass
+& $bm check --skip-sql                     # restore-only machine: everything except SQL Server and the backup folder
 & $bm backup                               # back up now (what the scheduled task runs)
 & $bm list [--db Sales] [--server NAME] [--json]   # backups on Google Drive
 & $bm download latest --db Sales [--server NAME] --out D:\restore   # see RESTORE.md
@@ -333,18 +372,19 @@ reading every file first. Everything above it describes how to *use* the tool.
 
 | File | Responsibility | Key exports |
 | --- | --- | --- |
-| `packaging/install.ps1`, `uninstall.ps1` | Windows install/update/uninstall (PowerShell 5.1, pure ASCII) | — |
+| `packaging/install.ps1`, `uninstall.ps1` | Windows install/update/uninstall (PowerShell 5.1, pure ASCII). `install.ps1` also prepares SQL Server (`Initialize-SqlServer`: `System.Data.SqlClient` over shared memory + the SQL Server WMI provider) | — |
 | `packaging/backup-manager.cmd` | Launcher: runs `bin/backup-manager.js` with the bundled `node.exe` | — |
 | `packaging/backup-manager.env.template` | Commented env file template copied by the installer | — |
+| `packaging/sql-prepare.sql` | Manual SQL Server preparation for technicians who are not sysadmin (shipped in the zip) | — |
 | `scripts/build-package.js` | Builds the release zip (downloads + verifies Node, `npm ci --omit=dev`, writes `oauth-client.json`) | `build`, `verifyShasum`, `oauthClientJson` |
 | `bin/backup-manager.js` | Shebang wrapper: runs `main`, sets `process.exitCode`, prints `Error: …` for uncaught errors | — |
 | `src/cli.js` | Argument parsing (`node:util` `parseArgs`), command dispatch, human/JSON output | `main`, `USAGE` |
-| `src/envconfig.js` | Parses `backup-manager.env` (`util.parseEnv`), validates with env-key error messages, maps onto `normalizeConfig`; reads `oauth-client.json` | `loadEnvConfig`, `envToConfig`, `parseEnvText`, `ENV_KEYS` |
+| `src/envconfig.js` | Parses `backup-manager.env` (`util.parseEnv`), validates with env-key error messages, maps onto `normalizeConfig`; reads `oauth-client.json` | `loadEnvConfig`, `envToConfig`, `parseEnvText`, `isLocalSqlHost`, `ENV_KEYS` |
 | `src/paths.js` | Program folder (`APP_ROOT`) and data folder (`BACKUP_MANAGER_HOME`, default `C:\ProgramData\backup-manager`) | `appHome`, `appPaths`, `APP_ROOT` |
-| `src/check.js` | The `check` command: all checks with injected I/O, SQL error explanations | `runChecks`, `explainSqlError`, `formatChecks` |
+| `src/check.js` | The `check` command: all checks with injected I/O (`skipAuth`, `skipSql`), SQL error explanations with the exact fix SQL | `runChecks`, `explainSqlError`, `formatChecks`, `verifyGrantFix` |
 | `src/config.js` | Validates and applies defaults (`normalizeConfig`); internal JSON loader (`-c`, development only) | `loadConfig`, `normalizeConfig`, `ConfigError`, `parseEncryptionKey` |
 | `src/auth.js` | OAuth installed-app flow (loopback + PKCE + state, plus paste fallback), token file I/O, status, logout/revoke | `login`, `status`, `logout`, `getAuthorizedClient`, `startLoopbackServer`, `parsePastedRedirect` |
-| `src/mssql.js` | SQL text builders + `MssqlClient` wrapper (connect, online check, BACKUP permission, version, BACKUP, VERIFYONLY) | `MssqlClient`, `buildBackupSql`, `buildVerifySql`, `toPoolConfig` |
+| `src/mssql.js` | SQL text builders + `MssqlClient` wrapper (connect, online check, BACKUP and verify permission, version, BACKUP, VERIFYONLY); `formatSqlError` prints every server message (`err.precedingErrors`) | `MssqlClient`, `buildBackupSql`, `buildVerifySql`, `toPoolConfig`, `formatSqlError`, `sqlErrorNumbers` |
 | `src/drive.js` | Minimal Drive v3 client: folders, list, chunked resumable upload, download, delete, retry policy | `DriveStore`, `isRetryable`, `escapeQuery`, `APP_TAG` |
 | `src/transform.js` | Streaming gzip, segmented AES-256-GCM encrypt/decrypt, hashing (SHA-256 + MD5) | `packFile`, `unpackFile`, `hashFile`, `createEncryptStream`, `createDecryptStream` |
 | `src/backup.js` | Orchestration: backup → verify → pack → upload → check → retention; list; download | `runBackups`, `backupOne`, `applyRetention`, `listBackups`, `downloadBackup`, `selectTargets` |
@@ -442,6 +482,14 @@ AAD        = the 13-byte header
    error names the env key. This prevents typos from silently changing behaviour.
 8. **OAuth scope stays `drive.file`.** Wider scopes need Google app verification and expose the user's whole Drive.
 9. **`download` refuses unsafe names and doesn't overwrite** without `force`. File names come from Drive and are untrusted.
+10. **The installer's T-SQL is constant text.** In `install.ps1`, every `Invoke-SqlAdmin -Sql` argument is a top-level
+    single-quoted `$Sql*` constant. Login names, database names and the password go in only as `SqlParameter`s; DDL
+    that can't take parameters is built inside T-SQL with `QUOTENAME()` and run with `sp_executesql`.
+    `test/install-functions.ps1` enforces this.
+11. **The installer never restarts SQL Server unasked and never changes the firewall.** A restart happens only after
+    the technician types `RESTART`; Enter changes nothing that needs a restart.
+12. **SQL error messages are complete.** Print or log SQL errors through `formatSqlError` (the logger does it for
+    every `Error`): the real cause (e.g. Msg 262) is often in `precedingErrors`, not in the final message.
 
 ### Retry policy (`src/drive.js`)
 
@@ -475,8 +523,9 @@ AAD        = the 13-byte header
 | `test/drive.test.js` | Folder creation and reuse, chunked upload and resume, list, download, delete, retry rules |
 | `test/auth.test.js` | Token file permissions, the loopback server (good state, CSRF state, denial, timeout), the paste fallback and logout |
 | `test/envconfig.test.js` | Env file parsing and mapping, env-key error messages, paths and `BACKUP_MANAGER_HOME` |
-| `test/check.test.js` | Every `check` outcome with fake SQL/Google, SQL Express error explanations |
-| `test/build-package.test.js` | Release build helpers (SHASUMS verification, `oauth-client.json`, Node version) |
+| `test/check.test.js` | Every `check` outcome with fake SQL/Google (including verify permission and `--skip-sql`), SQL error explanations (262 behind 3013) |
+| `test/install-functions.ps1` | Pure functions of `install.ps1` (password generator, instance resolution, local host, port plan, WMI namespace) and invariant 10. Windows PowerShell 5.1 in the Windows CI job; it loads only the function definitions via the AST |
+| `test/build-package.test.js` | Release build helpers (SHASUMS verification, `oauth-client.json`, Node version), packaging files present and pure ASCII |
 | `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `cli` | Unit tests for the pure parts, log files, CLI with `BACKUP_MANAGER_HOME` |
 
 Testing patterns to reuse:
@@ -497,7 +546,9 @@ Testing patterns to reuse:
 - **Change the backup SQL.** Edit `buildBackupSql` and `buildVerifySql` in `src/mssql.js` and update `test/mssql.test.js`. Keep invariants 1 and 2.
 - **Add notifications** (email, Slack). Hook into the result of `runBackups()` in the `backup` case of `cli.js`. Don't put them inside `backupOne`.
 - **Change the Windows scripts.** Keep them pure ASCII and compatible with Windows PowerShell 5.1; CI parses them with 5.1.
-  Under `irm | iex`, never call `exit` (it closes the technician's window): throw instead.
+  Under `irm | iex`, never call `exit` (it closes the technician's window): throw instead. Put logic you can test
+  without SQL Server into small pure functions and cover them in `test/install-functions.ps1`. New T-SQL goes into a
+  top-level `$Sql*` single-quoted constant (invariant 10).
 
 ### Deliberately out of scope
 
@@ -517,12 +568,14 @@ Testing patterns to reuse:
 
 ## Development
 
-Development happens on Linux with Node 22.
+Development happens on Linux with Node 22 (`nvm use` picks it up from `.nvmrc`; with Node 18, `npm test` finds no tests).
 
 ```bash
 npm install
 npm test                         # all unit tests (no SQL Server; only the logout tests reach Google's revoke endpoint)
 node --test test/drive.test.js   # a single file
+# install.ps1 functions (Windows PowerShell 5.1; CI runs this on windows-latest)
+#   powershell -NoProfile -ExecutionPolicy Bypass -File test\install-functions.ps1
 
 # run against a local env file instead of C:\ProgramData
 export BACKUP_MANAGER_HOME=~/.config/backup-manager      # holds backup-manager.env, token.json, logs/

@@ -55,10 +55,12 @@ Steps:
 5. If `BACKUP_ENCRYPTION_KEY` is empty, generate a key, write it into the env file, and **show it once**
    (see *Encryption*).
 6. Lock down the folders with `icacls` (see *ACLs*).
-7. Run `backup-manager check`. On failure, stop with a plain-language message. Re-running the installer is safe.
-8. Run `backup-manager auth login` if there is no valid token.
-9. Register or update the scheduled task (see *Task Scheduler*).
-10. Run the first backup and print the result.
+7. Prepare SQL Server: login, permissions, SQL Browser, and mixed mode / TCP/IP after the technician confirms a
+   restart. Added in v0.1.1, see [sql-setup-plan.md](sql-setup-plan.md).
+8. Run `backup-manager check`. On failure, stop with a plain-language message. Re-running the installer is safe.
+9. Run `backup-manager auth login` if there is no valid token.
+10. Register or update the scheduled task (see *Task Scheduler*).
+11. Run the first backup and print the result.
 
 **Update:** run the installer again. It keeps the env file and the token.
 
@@ -83,6 +85,7 @@ SQL_PORT=1433
 # For a named instance such as SQLEXPRESS (needs the SQL Browser service, or set SQL_PORT instead):
 SQL_INSTANCE=
 SQL_USER=backup_user
+# Leave empty: the installer creates the login and fills this in
 SQL_PASSWORD=
 # Comma-separated
 SQL_DATABASES=Sales,HR
@@ -183,7 +186,8 @@ All of `C:\ProgramData\backup-manager\` can be moved with the `BACKUP_MANAGER_HO
 - The env file is valid.
 - The SQL connection works.
 - Each database exists and is `ONLINE`.
-- The login has BACKUP permission (`HAS_PERMS_BY_NAME`).
+- The login has BACKUP permission (`HAS_PERMS_BY_NAME`), and CREATE DATABASE in master, which `RESTORE VERIFYONLY`
+  needs (added in v0.1.1).
 - The backup folder exists and is readable and deletable by this process.
 - The Google token works, and it shows which account is signed in.
 - The Healthchecks URL has a valid format.
