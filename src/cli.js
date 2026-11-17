@@ -22,10 +22,10 @@ Commands:
   auth status                          Show the connected Google account
   auth logout                          Revoke and delete the stored Google sign-in
   backup [--db D]                      Back up the configured databases now
-  list [--db D]                        List backups stored on Google Drive
+  list [--db D] [--server S]           List backups stored on Google Drive
   download <fileId> [--out DIR] [--force]
                                        Download + decrypt + decompress a backup to .bak
-  download latest --db D [--out DIR] [--force]
+  download latest --db D [--server S] [--out DIR] [--force]
   keygen                               Print a new random encryption key (base64)
 
 Settings are read from backup-manager.env in the data folder
