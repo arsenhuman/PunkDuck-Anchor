@@ -149,6 +149,22 @@ try {
     Remove-Item -LiteralPath $envTmp -ErrorAction SilentlyContinue
 }
 
+# ---- Test-ZipHash (reuse of a cached zip) ----
+$zipTmp = [IO.Path]::GetTempFileName()
+$shaTmp = [IO.Path]::GetTempFileName()
+try {
+    [IO.File]::WriteAllText($zipTmp, 'zip-bytes')
+    $hex = (Get-FileHash -Algorithm SHA256 -Path $zipTmp).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText($shaTmp, "$($hex.ToUpperInvariant())  backup-manager-1.2.0-win-x64.zip`n")
+    Assert-True (Test-ZipHash $zipTmp $shaTmp) 'matching hash (any case, with file name) is accepted'
+    [IO.File]::WriteAllText($zipTmp, 'zip-byte')
+    Assert-True (-not (Test-ZipHash $zipTmp $shaTmp)) 'a truncated zip is rejected'
+    [IO.File]::WriteAllText($shaTmp, '')
+    Assert-True (-not (Test-ZipHash $zipTmp $shaTmp)) 'an empty .sha256 is rejected'
+} finally {
+    Remove-Item -LiteralPath $zipTmp, $shaTmp -ErrorAction SilentlyContinue
+}
+
 # ---- ConvertTo-SqlInstanceName / Format-SqlInstanceNames ----
 Assert-Equal '' (ConvertTo-SqlInstanceName 'MSSQLSERVER') 'default instance is the empty SQL_INSTANCE'
 Assert-Equal 'SQLEXPRESS' (ConvertTo-SqlInstanceName 'MSSQL$SQLEXPRESS') 'named instance is the part after MSSQL$'
