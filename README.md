@@ -1,9 +1,11 @@
 # PunkDuck-Anchor: backup-manager
 
+> **Technicians installing at a client: follow [INSTALL.md](INSTALL.md).** This README is the reference behind it.
+
 A Windows program that takes **native SQL Server backups** (`BACKUP DATABASE ... TO DISK`) every night and uploads
 them, compressed and encrypted, to the **client's own Google Drive**.
 
-- **Target:** Windows 10/11 x64, SQL Server 2016 or newer (Express included). One SQL Server per machine.
+- **Target:** Windows 10/11 or Windows Server 2016 or newer, x64; SQL Server 2016 or newer (Express included). One SQL Server per machine.
 - **Delivery:** a self-contained release zip (bundled `node.exe`, nothing to install beforehand), installed by
   **our team over RDP** with `install.ps1`. The installer also prepares SQL Server (login, permissions, mixed mode,
   TCP/IP); the only decision it asks for is whether SQL Server may be restarted now.
@@ -117,6 +119,9 @@ Before you start, have ready:
 Open **Windows PowerShell as Administrator** and run:
 
 ```powershell
+# TLS 1.2 first: Windows PowerShell 5.1 on Windows Server 2016 can't reach GitHub without it
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+
 # latest release
 irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
 
@@ -136,12 +141,13 @@ Installer options (they need the `-File` form, not `irm | iex`):
 
 The installer:
 
-1. Checks for Administrator rights and Windows 10/11 x64.
+1. Checks for Administrator rights and Windows 10/11 or Windows Server 2016+ x64.
 2. Downloads the zip and its `.sha256` (or takes them from `-ZipPath`) and verifies the hash.
 3. Extracts to `C:\Program Files\backup-manager\` (only the program files are replaced).
-4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill it in
-   (leave `SQL_PASSWORD` and `BACKUP_ENCRYPTION_KEY` empty), save, close Notepad and press Enter.
-5. If `BACKUP_ENCRYPTION_KEY` is empty, generates a key, writes it into the env file and **shows it once**.
+4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill in the lines
+   marked `FILL IN`, save, close Notepad and press Enter.
+5. If `BACKUP_ENCRYPTION_KEY` is empty, generates a key, writes it into the env file, copies it to the clipboard
+   and **shows it once**.
    **Store it in the company password manager** under the client, then type `SAVED`.
 6. Locks both folders down to SYSTEM and Administrators.
 7. **Prepares SQL Server** (see *SQL Server preparation*): SQL login, permissions, SQL Browser, and, only after you
@@ -181,10 +187,19 @@ What it does, all safe to repeat:
 1. Finds the SQL Server service from `SQL_INSTANCE` (`MSSQLSERVER` if empty, otherwise `MSSQL$<instance>`) and
    starts it if it is stopped. It skips the whole step if `SQL_HOST` is not this machine.
 2. Checks that every database in `SQL_DATABASES` exists, is `ONLINE` and is writable, before it changes anything.
-3. **The login `SQL_USER`.** If `SQL_PASSWORD` is empty, it creates the login, or resets the password of an existing
-   one, with a random 32-character password and writes that into the env file. The password is never shown.
-   If `SQL_PASSWORD` is already set, the password is left alone. Either way the login is enabled, its default
-   database is `master`, and password expiry is turned off, so an expiry policy can't silently stop the nightly backups.
+3. **The login.**
+   - `SQL_USER` and `SQL_PASSWORD` **both empty** (the default): it creates the login `backup_user` with a random
+     32-character password and writes both into the env file. The password is never shown. If `backup_user` already
+     exists (e.g. the env file was deleted), its password is reset.
+   - **Both set:** that login is used. An existing login is **not changed** (password, options); a login that doesn't
+     exist yet is created with that password.
+   - `SQL_USER` set, `SQL_PASSWORD` empty: a new login is created with a random password. If that login already
+     exists, the installer stops: it never resets the password of a login it doesn't own. Enter its password, or
+     empty `SQL_USER`.
+   - `SQL_PASSWORD` set, `SQL_USER` empty: the installer stops.
+
+   A login the installer creates is enabled, its default database is `master`, and password expiry is turned off,
+   so an expiry policy can't silently stop the nightly backups.
 4. **Permissions.** In `master`, a user with `CREATE DATABASE`: `RESTORE VERIFYONLY`, which checks every backup,
    needs it, and `db_backupoperator` is not enough. In every database, a user in `db_backupoperator`. A user left
    orphaned by a restore from another server is re-linked to the login.
@@ -236,7 +251,7 @@ Common SQL Server traps, all detected by `backup-manager check`:
 | **TCP/IP is disabled** (default on new installs, especially Express) | Yes, after `RESTART` | SQL Server Configuration Manager > SQL Server Network Configuration > Protocols > enable TCP/IP, restart the SQL Server service |
 | **SQL Browser stopped** with a named instance (`SQL_INSTANCE=SQLEXPRESS`) | Yes | Start the "SQL Server Browser" service (Automatic), or set `SQL_PORT` to the instance's fixed port |
 | **Mixed-mode authentication disabled** (Windows logins only) | Yes, after `RESTART` | SSMS > server Properties > Security > "SQL Server and Windows Authentication mode", restart |
-| **Login failed** | Yes, if `SQL_PASSWORD` is empty | Wrong `SQL_USER`/`SQL_PASSWORD`, or the login is disabled |
+| **Login failed** | Yes, if `SQL_USER` and `SQL_PASSWORD` are empty | Wrong `SQL_USER`/`SQL_PASSWORD`, or the login is disabled |
 | **No verify permission** (Msg 262 + Msg 3013 "VERIFY DATABASE is terminating abnormally") | Yes | `GRANT CREATE DATABASE` in `master`, see `sql-prepare.sql` |
 | **No BACKUP permission** | Yes | `db_backupoperator` in each database, see `sql-prepare.sql` |
 | **Self-signed TLS certificate** | Not needed: trusted by default for a SQL Server on this machine | Remove `SQL_TRUST_SERVER_CERTIFICATE=false` from the env file |
@@ -246,46 +261,16 @@ Common SQL Server traps, all detected by `backup-manager check`:
 
 The env file is the **only** supported configuration. Format: `KEY=VALUE`, `#` starts a comment line.
 
-```ini
-# ---- SQL Server ----
-SQL_HOST=localhost
-SQL_PORT=1433
-# Instance name: the part after "MSSQL$" in the SQL Server service name (e.g. SQLEXPRESS, or the client's own name).
-# Leave empty for the default instance (service "MSSQLSERVER"). A named instance needs the SQL Browser service,
-# or set SQL_PORT to its fixed port instead.
-SQL_INSTANCE=
-SQL_USER=backup_user
-# Leave empty: the installer creates the login and fills this in
-SQL_PASSWORD=
-# REQUIRED: the client's databases, comma-separated, exactly as shown in SSMS (e.g. Db1,Db2)
-SQL_DATABASES=
-# Folder SQL Server writes backups to. Leave empty: the installer asks SQL Server for its default backup folder
-SQL_BACKUP_DIR=
-
-# ---- Naming on Google Drive (default: computer name) ----
-SERVER_NAME=
-
-# ---- Google account (the client's own Gmail; backups go to THEIR Drive) ----
-GOOGLE_EMAIL=client@gmail.com
-
-# ---- Schedule & retention ----
-BACKUP_TIME=02:00
-KEEP_LAST=7
-KEEP_DAYS=30
-
-# ---- Monitoring (Healthchecks.io ping URL for this client) ----
-HEALTHCHECK_URL=
-
-# ---- Encryption (ON by default; leave empty and the installer generates a key and shows it ONCE) ----
-BACKUP_ENCRYPTION_KEY=
-```
+The template, with instructions for the technician, is
+[`packaging/backup-manager.env.template`](packaging/backup-manager.env.template). Fields the installer fills in
+(`SQL_USER`, `SQL_PASSWORD`, `SQL_BACKUP_DIR`, `BACKUP_ENCRYPTION_KEY`) are left empty there.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `SQL_HOST` | `localhost` | SQL Server host. It must run on this machine (the program reads the `.bak` from `SQL_BACKUP_DIR`) |
 | `SQL_PORT` | `1433` | TCP port. With `SQL_INSTANCE` set, a value other than 1433 means "connect to this port directly, skip SQL Browser" |
 | `SQL_INSTANCE` | (none) | Named instance: the part after `MSSQL$` in the service name, e.g. `SQLEXPRESS`. Empty for the default instance (`MSSQLSERVER`). Found through the SQL Browser service |
-| `SQL_USER`, `SQL_PASSWORD` | `backup_user` / filled in by the installer | SQL login. Leave `SQL_PASSWORD` empty and the installer creates the login and writes the password here. A restore-only machine doesn't need it |
+| `SQL_USER`, `SQL_PASSWORD` | filled in by the installer | SQL login. Leave both empty and the installer creates `backup_user` and writes both here; or enter an existing login and its password to use that one (see *SQL Server preparation*). A restore-only machine doesn't need them |
 | `SQL_DATABASES` | required | Comma-separated database names, as shown in SSMS. A restore-only machine doesn't need it |
 | `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to. A restore-only machine doesn't need it |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
@@ -569,7 +554,7 @@ Testing patterns to reuse:
 ### Deliberately out of scope
 
 - Web UI, Docker image, automatic `RESTORE DATABASE` into SQL Server (a `restore` command), key escrow, code signing,
-  Windows Server/Linux/macOS targets, Windows Event Log, several SQL Server instances per machine, notifications and
+  Linux/macOS targets, Windows Server older than 2016 and 32-bit/ARM Windows (the bundled Node 22 doesn't run there), Windows Event Log, several SQL Server instances per machine, notifications and
   service-account auth.
 - Differential and transaction-log backups. Every backup is a full `COPY_ONLY` backup.
 - Per-database retention overrides. Retention is global and applied separately to each database's folder.

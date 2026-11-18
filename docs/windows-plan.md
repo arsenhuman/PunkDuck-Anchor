@@ -8,7 +8,7 @@ Builds on branch `chore/node22-deps`: Node 22 LTS, `mssql@12`, `google-auth-libr
 
 ## Target platform
 
-- **Windows 10/11 x64 only**, PowerShell 5.1. Windows Server, Linux and macOS are not targets.
+- **Windows 10/11 or Windows Server 2016+, x64**, PowerShell 5.1 (Windows Server added later). Linux and macOS are not targets.
 - **SQL Server 2016 or newer, including Express.**
 - Development still happens on Linux. Unit tests must pass on Linux, and Windows behaviour is verified in CI.
 
