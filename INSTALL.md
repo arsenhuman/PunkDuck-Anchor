@@ -39,8 +39,10 @@ On the client's server:
 1. Click **Start** and type `powershell`.
 2. Right-click **Windows PowerShell**, then **Run as administrator**, then **Yes**.
 
-> **Don't click inside the PowerShell window while the installer runs.** A click selects text and pauses the
-> installer. If the window title starts with **"Select"**, press **Esc** to continue.
+> **Don't click inside the PowerShell window while the installer runs.** The installer turns mouse selection off,
+> except while it shows the encryption key and during the Google sign-in: there, select text with the mouse and
+> press **Enter** to copy it. While text is selected the installer pauses; if the window title starts with
+> **"Select"**, press **Enter** or **Esc** to continue.
 
 ---
 
@@ -107,15 +109,19 @@ Type RESTART to apply now, or press Enter to stop and run the installer again la
   disconnected for about 30 seconds.
 - If not now: press **Enter**. Nothing is changed. Run the installer again later, when a restart is OK.
 
-If your Windows account can't sign in to SQL Server or isn't a sysadmin, the installer asks for a SQL Server
-sysadmin login instead:
+To sign in to SQL Server as a sysadmin, the installer tries, in this order:
+
+1. `SQL_USER` / `SQL_PASSWORD` from the settings file, if both are filled in and that login is a sysadmin (you get
+   a warning then: the nightly backups don't need sysadmin rights);
+2. your Windows account;
+3. a SQL Server sysadmin login that it asks for:
 
 ```
-SQL Server sysadmin login (Enter for sa, or type SKIP to stop)
+SQL Server sysadmin login (Enter for sa)
 ```
 
-Press **Enter** for `sa` and type its password. It's used only for this step and isn't saved. You get 3 tries. If
-you don't have a sysadmin password, type `SKIP` and see section 7.
+Press **Enter** for `sa` and type its password. It's used only for this step and isn't saved. The installer keeps
+asking until a sysadmin signs in. If you don't have a sysadmin password, press **Ctrl+C** and see section 7.
 
 ### Step 9/11: Google sign-in
 
