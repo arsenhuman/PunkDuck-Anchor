@@ -109,8 +109,8 @@ The ping is best-effort (10 s timeout, 3 attempts) and never changes the backup 
 ## Installing on a client machine (over RDP)
 
 Before you start, have ready:
-- a Windows account that is a **SQL Server sysadmin** (normally the account that installed SQL Server; otherwise see
-  *SQL Server preparation*);
+- a Windows account that is a **SQL Server sysadmin** (normally the account that installed SQL Server), or the
+  password of a sysadmin SQL login such as `sa`; otherwise see *SQL Server preparation*;
 - a moment when a **~30 s SQL Server restart** is acceptable, in case mixed mode or TCP/IP still has to be enabled;
 - the client's Gmail address and password, or the client at hand to sign in;
 - the Healthchecks ping URL;
@@ -181,6 +181,8 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninst
 
 **The installer does this for you** (step 7), connected with your Windows account. It doesn't use TCP/IP or a SQL
 login for this, so it works on a brand-new SQL Server Express. Your account must be a SQL Server **sysadmin**.
+If it isn't, the installer asks for a sysadmin SQL login instead (Enter for `sa`). That only works when mixed mode
+is already on. The password is kept in memory for step 7 only and never written to disk.
 
 What it does, all safe to repeat:
 
@@ -225,8 +227,8 @@ Type RESTART to apply now, or press Enter to stop and run the installer again la
 It ends with a summary (login created/kept, databases, settings changed, restart or not). A second run finds
 nothing to change and does not ask again.
 
-**When you are not a SQL Server sysadmin** (the client's DBA manages SQL Server), the installer stops at step 7 and
-names the account it used. Then:
+**When you have no sysadmin access at all** (no Windows sysadmin account and no `sa` password; e.g. the client's
+DBA manages SQL Server), type `SKIP` at the login prompt and the installer stops at step 7. Then:
 
 1. The DBA runs `C:\Program Files\backup-manager\sql-prepare.sql` in SSMS (it is commented; replace the login name,
    password and database name first) and enables mixed mode and TCP/IP if needed.

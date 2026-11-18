@@ -388,6 +388,10 @@ $SqlPing = 'SELECT 1;'
 
 $SqlPrepareScript = Join-Path $InstallDir 'sql-prepare.sql'
 
+# Set by Connect-SqlAdminLogin when the technician signs in with a SQL login (e.g. sa) instead of Windows.
+# The password stays in a read-only SecureString, is never written anywhere and is dropped after step 7.
+$script:SqlAdminCredential = $null
+
 # ---- pure helpers (tested by test/install-functions.ps1) ----
 
 # Same rule as the program (src/envconfig.js isLocalSqlHost).
@@ -499,11 +503,16 @@ function Invoke-SqlAdmin {
     param([string]$DataSource, [string]$Sql, [hashtable]$Params = @{}, [switch]$Scalar)
     $csb = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
     $csb['Data Source'] = $DataSource
-    $csb['Integrated Security'] = $true
+    $csb['Integrated Security'] = (-not $script:SqlAdminCredential)
     $csb['Encrypt'] = $false
     $csb['Connect Timeout'] = 15
     $csb['Application Name'] = "$AppName installer"
-    $conn = New-Object System.Data.SqlClient.SqlConnection($csb.ConnectionString)
+    if ($script:SqlAdminCredential) {
+        # SqlCredential keeps the password out of the connection string.
+        $conn = New-Object System.Data.SqlClient.SqlConnection -ArgumentList $csb.ConnectionString, $script:SqlAdminCredential
+    } else {
+        $conn = New-Object System.Data.SqlClient.SqlConnection($csb.ConnectionString)
+    }
     try {
         $conn.Open()
         $cmd = $conn.CreateCommand()
@@ -610,6 +619,40 @@ function Write-SqlPrepareHelp {
     Write-Host 'Then run the installer again with -SkipSqlSetup (see README, "SQL Server preparation").' -ForegroundColor Yellow
 }
 
+# Fallback when the technician's Windows account is not a SQL Server sysadmin: sign in with a SQL login
+# such as sa (the Mersoft setup usually creates one). Only works when mixed mode is already on.
+# Returns the $SqlWhoAmI row; sets $script:SqlAdminCredential for the rest of step 7.
+function Connect-SqlAdminLogin([hashtable]$Inst) {
+    Write-Host ''
+    Write-Host 'You can sign in with a SQL Server sysadmin login instead (usually sa).' -ForegroundColor Yellow
+    Write-Host 'It is used only during this step and is not saved.' -ForegroundColor Yellow
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $name = "$(Read-Host 'SQL Server sysadmin login (Enter for sa, or type SKIP to stop)')".Trim()
+        if ($name -eq 'SKIP') { break }
+        if (-not $name) { $name = 'sa' }
+        if (-not (Test-SqlLoginName $name)) {
+            Write-Host "'$name' is not a SQL login name (DOMAIN\user is a Windows account)." -ForegroundColor Red
+            continue
+        }
+        $pw = Read-Host "Password for $name" -AsSecureString
+        $pw.MakeReadOnly()
+        $script:SqlAdminCredential = New-Object System.Data.SqlClient.SqlCredential -ArgumentList $name, $pw
+        try {
+            $me = @(Invoke-SqlAdmin -DataSource $Inst.DataSource -Sql $SqlWhoAmI)[0]
+        } catch {
+            $script:SqlAdminCredential = $null
+            Write-Host "Could not sign in as $name`: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host 'Wrong password, the login is disabled, or SQL Server accepts only Windows sign-in (mixed mode off).' -ForegroundColor Yellow
+            continue
+        }
+        if ($me.is_sysadmin -eq 1) { return $me }
+        $script:SqlAdminCredential = $null
+        Write-Host "$name is not a sysadmin on this SQL Server." -ForegroundColor Red
+    }
+    Write-SqlPrepareHelp
+    throw 'SQL Server preparation needs a SQL Server sysadmin.'
+}
+
 # Step 7. Idempotent: running it again changes only what is still missing.
 function Initialize-SqlServer {
     $sqlHost = Get-EnvValue $EnvFile 'SQL_HOST'
@@ -645,19 +688,18 @@ function Initialize-SqlServer {
         if (-not (Wait-SqlServer $inst.DataSource 90)) { throw "SQL Server ($($inst.ServiceName)) did not start." }
     }
 
-    # 2. Connect as the technician (Windows authentication) and require sysadmin
+    # 2. Connect as a sysadmin: the technician's Windows account, else a SQL login such as sa
+    $me = $null
     try {
         $me = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlWhoAmI)[0]
+        if ($me.is_sysadmin -ne 1) {
+            Write-Host "Your Windows account ($($me.login_name)) is not a sysadmin on this SQL Server." -ForegroundColor Yellow
+            $me = $null
+        }
     } catch {
-        Write-Host "Could not connect to SQL Server ($($inst.DataSource)) with your Windows account: $($_.Exception.Message)" -ForegroundColor Red
-        Write-SqlPrepareHelp
-        throw 'SQL Server preparation needs a SQL Server sysadmin.'
+        Write-Host "Could not connect to SQL Server ($($inst.DataSource)) with your Windows account: $($_.Exception.Message)" -ForegroundColor Yellow
     }
-    if ($me.is_sysadmin -ne 1) {
-        Write-Host "Your Windows account ($($me.login_name)) is not a sysadmin on this SQL Server." -ForegroundColor Red
-        Write-SqlPrepareHelp
-        throw 'SQL Server preparation needs a SQL Server sysadmin.'
-    }
+    if (-not $me) { $me = Connect-SqlAdminLogin $inst }
     Write-Host "Connected to $($inst.InstanceName) as $($me.login_name) (sysadmin)."
 
     # 3. Databases: all must exist, be ONLINE and writable before anything is created
@@ -837,7 +879,12 @@ function Install-BackupManager {
         Write-Host 'Skipped (-SkipSqlSetup).'
         Write-SqlPrepareHelp
     } else {
-        Initialize-SqlServer
+        try {
+            Initialize-SqlServer
+        } finally {
+            $script:SqlAdminCredential = $null
+            [System.Data.SqlClient.SqlConnection]::ClearAllPools()
+        }
     }
 
     # A restore-only machine never connects to SQL Server from this program: skip the SQL checks.
