@@ -142,7 +142,8 @@ Installer options (they need the `-File` form, not `irm | iex`):
 The installer:
 
 1. Checks for Administrator rights and Windows 10/11 or Windows Server 2016+ x64.
-2. Downloads the zip and its `.sha256` (or takes them from `-ZipPath`) and verifies the hash.
+2. Downloads the zip and its `.sha256` (or takes them from `-ZipPath`) and verifies the hash. A zip already downloaded
+   by an earlier run (in `%TEMP%\backup-manager-install\`) is reused if its hash still matches.
 3. Extracts to `C:\Program Files\backup-manager\` (only the program files are replaced).
 4. If `backup-manager.env` doesn't exist, creates it from the template and opens it in **Notepad**. Fill in the lines
    marked `FILL IN`, save, close Notepad and press Enter.

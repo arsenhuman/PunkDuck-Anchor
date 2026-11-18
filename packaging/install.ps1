@@ -12,6 +12,8 @@
 .PARAMETER ZipPath
     Install from a local backup-manager-<version>-win-x64.zip instead of downloading it.
     The matching .sha256 file must be next to it.
+    Without -ZipPath, a zip this installer already downloaded to %TEMP%\backup-manager-install is reused
+    when its SHA-256 still matches, so running the installer again does not download the same version twice.
 
 .PARAMETER RestoreOnly
     Restore machine for another client's backups (see RESTORE.md): skip SQL Server preparation, the SQL checks,
@@ -189,6 +191,21 @@ function Test-SupportedWindows([int]$Major, [int]$Build, [int]$ProductType, [str
     return ($ProductType -eq 2 -or $ProductType -eq 3) -and $Build -ge 14393
 }
 
+function Get-ExpectedHash([string]$ShaFile) {
+    $text = Get-Content -Raw $ShaFile
+    if (-not $text) { return '' }
+    return ($text.Trim() -split '\s+')[0].ToLowerInvariant()
+}
+
+function Get-ActualHash([string]$Zip) {
+    return (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLowerInvariant()
+}
+
+function Test-ZipHash([string]$Zip, [string]$ShaFile) {
+    $expected = Get-ExpectedHash $ShaFile
+    return ($expected -ne '') -and ($expected -eq (Get-ActualHash $Zip))
+}
+
 function Get-Package {
     # Returns the path of a verified zip.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -210,14 +227,21 @@ function Get-Package {
         $base = "https://github.com/$Repo/releases/download/v$($script:Version)"
         $zip = Join-Path $tmp $name
         $shaFile = "$zip.sha256"
-        Write-Host "Downloading $name ..."
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $zip
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.sha256" -OutFile $shaFile
+        # Reuse a zip left by an earlier run of this installer, but only if it still matches its .sha256.
+        # A partial or damaged copy is simply downloaded again.
+        if ((Test-Path $zip) -and (Test-Path $shaFile) -and (Test-ZipHash $zip $shaFile)) {
+            Write-Host "Using already downloaded $zip"
+        } else {
+            Write-Host "Downloading $name ..."
+            Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $zip
+            Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.sha256" -OutFile $shaFile
+        }
     }
 
-    $expected = ((Get-Content -Raw $shaFile).Trim() -split '\s+')[0].ToLowerInvariant()
-    $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
-    if ($expected -ne $actual) { throw "SHA-256 mismatch for $zip (download corrupted?). Expected $expected, got $actual." }
+    if (-not (Test-ZipHash $zip $shaFile)) {
+        throw "SHA-256 mismatch for $zip (download corrupted?). Expected $(Get-ExpectedHash $shaFile), got $(Get-ActualHash $zip)."
+    }
+    $actual = Get-ActualHash $zip
     Write-Host "SHA-256 verified: $actual"
     return $zip
 }
