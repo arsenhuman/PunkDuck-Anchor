@@ -97,6 +97,15 @@ test('SQL Server older than 2016 fails', async () => {
   assert.match(formatChecks(r.checks), /older than SQL Server 2016/);
 });
 
+test('backup folder share missing names SQL_LOCAL_BACKUP_DIR (remote SQL Server)', async () => {
+  const config = await setup({ server: { host: 'sqlbox', backupDir: 'D:\\Backup', localBackupDir: '/definitely/not/here' } });
+  const r = await runChecks({ loadConfig: async () => config, createSqlClient: fakeSql().create, authStatus: signedIn });
+  assert.equal(r.ok, false);
+  const out = formatChecks(r.checks);
+  assert.match(out, /\[FAIL\] Backup folder: SQL_LOCAL_BACKUP_DIR .* does not exist/);
+  assert.match(out, /network share of SQL_BACKUP_DIR/);
+});
+
 test('backup folder missing', async () => {
   const config = await setup({ server: { localBackupDir: '/definitely/not/here' } });
   const r = await runChecks({ loadConfig: async () => config, createSqlClient: fakeSql().create, authStatus: signedIn });

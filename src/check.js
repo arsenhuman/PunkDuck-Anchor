@@ -59,11 +59,12 @@ export function explainSqlError(err, server = {}) {
     return {
       problem: `The TLS certificate of ${where} is not trusted (SQL Server uses a self-signed certificate by default).`,
       fix: 'For a SQL Server on this machine, use SQL_HOST=localhost and remove SQL_TRUST_SERVER_CERTIFICATE=false '
-        + 'from the env file (or set it to true).',
+        + 'from the env file (or set it to true). For a SQL Server on another machine on the client\'s network, '
+        + 'add SQL_TRUST_SERVER_CERTIFICATE=true, or install a trusted certificate on that SQL Server.',
     };
   }
   if (/ENOTFOUND|getaddrinfo/i.test(msg)) {
-    return { problem: `The host name in SQL_HOST ("${server.host}") does not exist.`, fix: 'Use localhost for a SQL Server on this machine.' };
+    return { problem: `The host name in SQL_HOST ("${server.host}") does not exist.`, fix: 'Use localhost for a SQL Server on this machine, otherwise its computer name or IP address.' };
   }
   if (code === 'ESOCKET' || code === 'ETIMEOUT' || /ECONNREFUSED|ETIMEDOUT|Failed to connect|timeout/i.test(msg)) {
     return {
@@ -208,8 +209,12 @@ async function checkBackupFolder(server, { add, fail }) {
     const why = err.code === 'ENOENT' ? 'does not exist'
       : err.code === 'ENOTDIR' ? 'is not a folder'
         : `is not readable/deletable by this program (${err.code || err.message})`;
-    fail('Backup folder', `SQL_BACKUP_DIR ${dir} ${why}`,
-      'Set SQL_BACKUP_DIR to the folder SQL Server writes backups to (SSMS > server Properties > Database Settings > Backup).');
+    const key = server.backupDir && dir !== path.resolve(server.backupDir) ? 'SQL_LOCAL_BACKUP_DIR' : 'SQL_BACKUP_DIR';
+    const fix = key === 'SQL_BACKUP_DIR'
+      ? 'Set SQL_BACKUP_DIR to the folder SQL Server writes backups to (SSMS > server Properties > Database Settings > Backup).'
+      : 'Set SQL_LOCAL_BACKUP_DIR to the network share of SQL_BACKUP_DIR, and give the account this program runs as '
+        + '(the scheduled task runs as SYSTEM, i.e. this computer\'s account on the network) read and delete rights on it.';
+    fail('Backup folder', `${key} ${dir} ${why}`, fix);
   }
 }
 

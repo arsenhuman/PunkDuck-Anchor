@@ -14,6 +14,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 /** Every key the env file may contain. Anything else is reported as a typo. */
 export const ENV_KEYS = [
   'SQL_HOST', 'SQL_PORT', 'SQL_INSTANCE', 'SQL_USER', 'SQL_PASSWORD', 'SQL_DATABASES', 'SQL_BACKUP_DIR',
+  'SQL_LOCAL_BACKUP_DIR',
   'SQL_ENCRYPT', 'SQL_TRUST_SERVER_CERTIFICATE',
   'SERVER_NAME', 'GOOGLE_EMAIL', 'BACKUP_TIME', 'KEEP_LAST', 'KEEP_DAYS',
   'HEALTHCHECK_URL', 'BACKUP_ENCRYPTION_KEY', 'LOG_LEVEL',
@@ -101,6 +102,10 @@ function flag(vars, key, dflt) {
  * @param requireSql  false for commands that never connect to SQL Server (list, download, auth,
  *                    check --skip-sql): SQL_PASSWORD, SQL_DATABASES and SQL_BACKUP_DIR may then be
  *                    empty (restore-only machines).
+ *
+ * SQL_BACKUP_DIR is the folder as SQL Server sees it (BACKUP DATABASE writes there). This program reads
+ * the .bak from SQL_LOCAL_BACKUP_DIR, the same folder as seen from this machine, e.g. a share
+ * \\sqlhost\Backup. Empty = SQL_BACKUP_DIR (SQL Server on this machine); required for a remote SQL_HOST.
  */
 export function envToConfig(vars, { google, paths, hostname, computerName, requireSql = true } = {}) {
   const get = (k) => (vars[k] ?? '').trim();
@@ -123,6 +128,12 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
   const backupDir = get('SQL_BACKUP_DIR');
   req(!requireSql || backupDir, 'SQL_BACKUP_DIR is empty (the installer fills it in from SQL Server; '
     + 'otherwise SSMS > server Properties > Database Settings > Backup)');
+  const localBackupDir = get('SQL_LOCAL_BACKUP_DIR');
+  const local = isLocalSqlHost(host, { hostname, computerName });
+  req(!requireSql || local || localBackupDir,
+    `SQL_LOCAL_BACKUP_DIR is empty, but SQL_HOST "${host}" is another machine: SQL Server writes the backup there, `
+    + 'so this program needs that folder as a network share. Set SQL_LOCAL_BACKUP_DIR to the share of SQL_BACKUP_DIR, '
+    + 'e.g. \\\\sqlhost\\Backup');
 
   const serverName = get('SERVER_NAME') || defaultServerName(hostname);
   req(/^[A-Za-z0-9._-]{1,64}$/.test(serverName), `SERVER_NAME may only contain letters, digits, ".", "_" and "-" (max 64), got "${serverName}"`);
@@ -165,10 +176,10 @@ export function envToConfig(vars, { google, paths, hostname, computerName, requi
       password: vars.SQL_PASSWORD ?? '',
       encrypt: flag(vars, 'SQL_ENCRYPT', true),
       // SQL Server's certificate is self-signed by default; for a connection to this machine that is fine.
-      trustServerCertificate: flag(vars, 'SQL_TRUST_SERVER_CERTIFICATE', isLocalSqlHost(host, { hostname, computerName })),
+      trustServerCertificate: flag(vars, 'SQL_TRUST_SERVER_CERTIFICATE', local),
       databases,
       backupDir,
-      localBackupDir: backupDir, // SQL Server runs on this machine
+      localBackupDir: localBackupDir || backupDir,
       nativeCompression: false, // not available on Express; gzip is used instead
     }],
     retention: { keepLast, keepDays },

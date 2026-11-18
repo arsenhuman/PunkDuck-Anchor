@@ -208,6 +208,10 @@ Still stuck? Send the red message and the log from `C:\ProgramData\backup-manage
    powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipSqlSetup
    ```
 
+**SQL Server runs on another machine** (you only have a SQL login to it): this needs a network share of SQL
+Server's backup folder that the client's IT sets up once, and in practice an Active Directory domain. See
+README, *SQL Server on another machine*.
+
 **No internet access to GitHub on the server:** download `backup-manager-<version>-win-x64.zip` **and** the matching
 `.sha256` file from the GitHub release page, copy both into the same folder on the server, then run:
 
