@@ -1,6 +1,6 @@
 {
   "name": "backup-manager",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Native MSSQL backups uploaded to Google Drive via OAuth",
   "type": "module",
   "bin": {
