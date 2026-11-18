@@ -160,6 +160,8 @@ Then check:
 - [ ] On **Healthchecks.io**, the client's check is green ("up").
 - [ ] The **encryption key** is in the password manager.
 - [ ] Optional: in the client's Google Drive there is a folder **MSSQL Backups** with the backup inside.
+- [ ] Optional: read the **install log** whose path is shown at the end (`Install log:`). It lists everything the
+      installer did, including each change in SQL Server (lines `SQL Server change:`). Passwords and the key are not in it.
 
 From now on, the backup runs **every night at 02:00** automatically.
 
@@ -168,6 +170,7 @@ From now on, the backup runs **every night at 02:00** automatically.
 ## 6. When something goes wrong
 
 The installer prints **INSTALL STOPPED:** in red with the reason. Fix it and run the same command again.
+Below it, `Install log:` shows the file with every step up to the error (in `C:\ProgramData\backup-manager\logs\`).
 
 | Message says | What to do |
 |--------------|------------|
