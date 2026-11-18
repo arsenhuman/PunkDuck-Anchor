@@ -23,12 +23,29 @@
     Do not prepare SQL Server (login, permissions, mixed mode, TCP/IP). For machines where the client's DBA
     manages SQL Server: the DBA runs sql-prepare.sql from the program folder instead.
 
+.PARAMETER Client
+    Several clients on one machine: install or update the client with this name (letters, digits, "-", "_",
+    at most 32). It gets its own data folder C:\ProgramData\backup-manager-clients\<name> (settings, encryption
+    key, Google sign-in, logs), its own scheduled task "PunkDuck Backup Manager (<name>)" and its own SQL login
+    (backup_<name>). The program files are shared: installing or updating any client updates them for all.
+    Without -Client the installer works on the default install (C:\ProgramData\backup-manager).
+
+.PARAMETER ListClients
+    Only list what is installed on this machine (the default install and every client: data folder,
+    scheduled task, next run, Google account) and exit.
+
 .EXAMPLE
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
     irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version 1.2.0
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -Client acme
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -ListClients
 #>
 [CmdletBinding()]
 param(
@@ -36,6 +53,8 @@ param(
     [string]$ZipPath,
     [switch]$RestoreOnly,
     [switch]$SkipSqlSetup,
+    [string]$Client,
+    [switch]$ListClients,
     [string]$Repo = 'arsenhuman/PunkDuck-Anchor'
 )
 
@@ -45,12 +64,116 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with the progress bar
 
 $AppName    = 'backup-manager'
-$TaskName   = 'PunkDuck Backup Manager'
 $InstallDir = Join-Path $env:ProgramFiles $AppName
-$DataDir    = Join-Path $env:ProgramData $AppName
-$EnvFile    = Join-Path $DataDir "$AppName.env"
-$LogDir     = Join-Path $DataDir 'logs'
 $Launcher   = Join-Path $InstallDir "$AppName.cmd"
+$ClientsDir = Join-Path $env:ProgramData "$AppName-clients"   # one folder per -Client, outside the default data folder
+
+# ---- Default install and clients (pure helpers, tested by test/install-functions.ps1) ----
+# uninstall.ps1 has its own copies of Test-ClientName and Get-ClientFromTaskName (it runs without this
+# file); the test checks that both copies give the same answers.
+
+# -Client: letters, digits, "-" and "_", 1 to 32 characters. Safe as a folder name, in a task name and in a
+# SQL login name. -cmatch: no Unicode case folding (the Kelvin sign would match k). \z, not $: "$" also matches
+# before a trailing newline. Refused, in any case:
+#   user:                   its login backup_user is the default install's login (step 7 would reset its password)
+#   con, nul, com1, ...:    Windows device names, not usable as folder names
+function Test-ClientName([string]$Name) {
+    if (-not ($Name -cmatch '^[A-Za-z0-9_-]{1,32}\z')) { return $false }
+    if ($Name -match '^(user|con|prn|aux|nul|com[0-9]|lpt[0-9])\z') { return $false }
+    return $true
+}
+
+# Where an install lives. $Client '' is the default install, exactly as before -Client existed.
+#   DataDir:        env file, token.json, logs\, work\
+#   TaskName:       the scheduled task
+#   DefaultSqlUser: the SQL login step 7 creates when SQL_USER is empty
+#   HomeArgs:       arguments that point backup-manager.cmd at DataDir (none for the default install)
+#   TaskArguments:  the arguments of the scheduled task
+function Get-InstallLayout([string]$Client, [string]$ProgramData) {
+    $ProgramData = $ProgramData.TrimEnd('\')
+    if (-not $Client) {
+        return @{
+            Client         = ''
+            Label          = 'default install'
+            DataDir        = "$ProgramData\backup-manager"
+            TaskName       = 'PunkDuck Backup Manager'
+            DefaultSqlUser = 'backup_user'
+            HomeArgs       = @()
+            TaskArguments  = 'backup'
+        }
+    }
+    if (-not (Test-ClientName $Client)) {
+        throw "Invalid -Client '$Client': use letters, digits, - and _ only, at most 32 characters (not user, con, nul, com1, ...)."
+    }
+    $dir = "$ProgramData\backup-manager-clients\$Client"
+    # Without quotes when possible: cmd.exe (the task runs a .cmd) strips quotes unpredictably when the
+    # command line has more than two. The launcher path already has two.
+    $homeArg = if ($dir -match '[\s&()^%!;,=]') { "`"$dir`"" } else { $dir }
+    return @{
+        Client         = $Client
+        Label          = "client $Client"
+        DataDir        = $dir
+        TaskName       = "PunkDuck Backup Manager ($Client)"
+        DefaultSqlUser = 'backup_' + $Client.ToLowerInvariant()
+        HomeArgs       = @('--home', $dir)
+        TaskArguments  = "--home $homeArg backup"
+    }
+}
+
+# Which install a scheduled task belongs to: '' for the default task, the client name for a client task,
+# $null for a task that is not ours.
+function Get-ClientFromTaskName([string]$TaskName) {
+    if ($TaskName -eq 'PunkDuck Backup Manager') { return '' }
+    if ($TaskName -cmatch '^PunkDuck Backup Manager \(([A-Za-z0-9_-]{1,32})\)\z') { return $Matches[1] }
+    return $null
+}
+
+# HH:mm of a task trigger's StartBoundary ("2026-01-01T02:00:00", maybe with an offset), '' if none.
+function Get-TaskStartTime([string]$StartBoundary) {
+    if ($StartBoundary -match 'T(\d\d:\d\d)') { return $Matches[1] }
+    return ''
+}
+
+# Client names found as folders under backup-manager-clients and as scheduled tasks: valid names only,
+# each once (case-insensitive, like Windows paths and task names), sorted.
+function Merge-ClientNames([string[]]$FolderNames, [string[]]$TaskClients) {
+    $seen = @{}
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($n in @($FolderNames) + @($TaskClients)) {
+        if (-not (Test-ClientName $n)) { continue }
+        $key = $n.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $names.Add($n)
+    }
+    return @($names | Sort-Object)
+}
+
+# $Layout, $TaskName, $DataDir, $EnvFile, $LogDir, $HomeArgs and $DefaultSqlUser are set at the bottom of this
+# file, at the top level (not with $script:), so they are the same variables whether the installer runs with
+# -File, "irm | iex" or "& ([scriptblock]::Create((irm ...))) -Client x".
+
+# The scheduled tasks of this program in the Task Scheduler root folder: the default one and every client's.
+# Fails (instead of returning nothing) when Task Scheduler cannot be queried: a missed running backup or
+# client task must never let the shared program files be replaced or removed.
+function Get-BackupTasks {
+    @(Get-ScheduledTask -ErrorAction Stop |
+        Where-Object { $_.TaskPath -eq '\' -and $null -ne (Get-ClientFromTaskName $_.TaskName) })
+}
+
+# Databases this install would back up that another install already backs up on the same SQL Server
+# instance. $Others: @{ Label; Instance; Databases }. Names compare case-insensitively (like SQL Server).
+# Returns "<db> (<label>)" strings.
+function Get-DatabaseConflicts([string]$Instance, [string[]]$Databases, [object[]]$Others) {
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($o in @($Others)) {
+        if (-not $o -or "$($o.Instance)".Trim() -ne "$Instance".Trim()) { continue }
+        foreach ($db in @($Databases)) {
+            if (@($o.Databases) -contains $db) { $found.Add("$db ($($o.Label))") }
+        }
+    }
+    return @($found)
+}
 
 function Write-Step([string]$Text) {
     Write-Host ''
@@ -106,14 +229,14 @@ function Invoke-WithQuickEdit([scriptblock]$Body) {
     try { & $Body } finally { Restore-ConsoleMode $before }
 }
 
-# Run backup-manager.cmd with the console attached (needed for the interactive sign-in).
-# Returns the exit code. Native stderr must not turn into terminating errors.
+# Run backup-manager.cmd with the console attached (needed for the interactive sign-in), on this install's
+# data folder (--home for a client). Returns the exit code. Native stderr must not turn into terminating errors.
 function Invoke-App {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $Launcher @Arguments | Out-Host
+        & $Launcher @HomeArgs @Arguments | Out-Host
         return $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $saved
@@ -175,9 +298,17 @@ function Format-SqlInstanceNames([string[]]$Names) {
 # Only SYSTEM and BUILTIN\Administrators get access (SIDs, so it works on any Windows language).
 # The root is locked first; only then are the children reset so they inherit from the locked root.
 # At no point is anything below $Path readable by other users.
+# The owner is set to Administrators too: an owner keeps the right to change the permissions, so a folder
+# created in advance by another user would otherwise stay theirs.
 function Lock-Folder([string]$Path) {
+    & icacls.exe $Path /setowner '*S-1-5-32-544' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls could not make Administrators the owner of $Path" }
     & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict access to $Path" }
+    if (Get-ChildItem -Force -Path $Path | Select-Object -First 1) {
+        & icacls.exe (Join-Path $Path '*') /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls could not make Administrators the owner below $Path" }
+    }
     if (Get-ChildItem -Force -Path $Path | Select-Object -First 1) {
         & icacls.exe (Join-Path $Path '*') /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed below $Path" }
@@ -264,9 +395,10 @@ function Get-Package {
 }
 
 function Install-ProgramFiles([string]$Zip) {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task -and $task.State -eq 'Running') {
-        throw 'A backup is running right now. Wait until it finishes (Task Scheduler) and run the installer again.'
+    # The program files are shared by the default install and every client: none of their backups may run.
+    $running = @(Get-BackupTasks | Where-Object { $_.State -eq 'Running' } | ForEach-Object { "'$($_.TaskName)'" })
+    if ($running.Count) {
+        throw "A backup is running right now ($($running -join ', ')). Wait until it finishes (Task Scheduler) and run the installer again."
     }
     $staging = "$InstallDir.new"
     $old = "$InstallDir.old"
@@ -297,6 +429,9 @@ function Initialize-EnvFile {
     }
     Copy-Item -Path (Join-Path $InstallDir "$AppName.env.template") -Destination $EnvFile
     Write-Host "Created $EnvFile from the template."
+    if ($Layout.Client) {
+        Write-Host "These are the settings of client $($Layout.Client) only: its databases and its Google account." -ForegroundColor Yellow
+    }
     Write-Host 'Fill in the settings in Notepad, save (Ctrl+S) and close Notepad.' -ForegroundColor Yellow
     if (-not $RestoreOnly) {
         Write-Host 'Required: SQL_DATABASES (the client''s databases as shown in SSMS) and SQL_INSTANCE for a named instance.' -ForegroundColor Yellow
@@ -312,7 +447,7 @@ function Initialize-EnvFile {
     }
     Write-Host 'Leave BACKUP_ENCRYPTION_KEY empty: a key is generated in the next step.' -ForegroundColor Yellow
     if (-not $RestoreOnly) {
-        Write-Host 'SQL_USER / SQL_PASSWORD: leave both empty and the installer creates a SQL login,' -ForegroundColor Yellow
+        Write-Host "SQL_USER / SQL_PASSWORD: leave both empty and the installer creates the SQL login $DefaultSqlUser," -ForegroundColor Yellow
         Write-Host '  or enter an existing SQL login and its password to use that one.' -ForegroundColor Yellow
     }
     Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$EnvFile`"" -Wait
@@ -340,7 +475,8 @@ function Initialize-EncryptionKey {
     } catch {
         Write-Host ' Could not copy the key to the clipboard: select it with the mouse and press Enter.' -ForegroundColor Yellow
     }
-    Write-Host ' Store it NOW in the company password manager under this client.' -ForegroundColor Yellow
+    $under = if ($Layout.Client) { "client $($Layout.Client)" } else { 'this client' }
+    Write-Host " Store it NOW in the company password manager under $under." -ForegroundColor Yellow
     Write-Host ' Without it, the backups of this machine can never be restored.' -ForegroundColor Yellow
     Write-Host '=====================================================================' -ForegroundColor Yellow
     Invoke-WithQuickEdit {
@@ -355,7 +491,7 @@ function Register-BackupTask {
     if (-not $time) { $time = '02:00' }
     $at = [datetime]::ParseExact($time, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
 
-    $action    = New-ScheduledTaskAction -Execute "`"$Launcher`"" -Argument 'backup' -WorkingDirectory $InstallDir
+    $action    = New-ScheduledTaskAction -Execute "`"$Launcher`"" -Argument $Layout.TaskArguments -WorkingDirectory $InstallDir
     $trigger   = New-ScheduledTaskTrigger -Daily -At $at
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
@@ -363,6 +499,12 @@ function Register-BackupTask {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
         -Settings $settings -Description 'Backs up SQL Server databases to Google Drive (backup-manager).' -Force | Out-Null
     Write-Host "Scheduled task '$TaskName': daily at $time as SYSTEM."
+    # Several installs on one SQL Server should not all back up at the same minute.
+    foreach ($o in @(Get-BackupTasks | Where-Object { $_.TaskName -ne $TaskName })) {
+        if (@($o.Triggers | Where-Object { (Get-TaskStartTime $_.StartBoundary) -eq $time }).Count) {
+            Write-Host "Note: '$($o.TaskName)' also starts at $time. Give one of them another BACKUP_TIME (e.g. 30 minutes later) and run the installer again for it." -ForegroundColor Yellow
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -503,8 +645,8 @@ function Test-SqlLoginName([string]$Name) {
     return $true
 }
 
-# Name of the login the installer creates when SQL_USER and SQL_PASSWORD are both empty.
-$DefaultSqlUser = 'backup_user'
+# The login the installer creates when SQL_USER and SQL_PASSWORD are both empty is $DefaultSqlUser:
+# backup_user for the default install, backup_<client> for -Client (see Get-InstallLayout).
 
 # What to do with the SQL login. $User is SQL_USER after the default was applied ('' never reaches here).
 #   use:      the technician gave SQL_USER and SQL_PASSWORD of an existing login -> keep it as it is
@@ -996,9 +1138,113 @@ function Initialize-SqlServer {
     foreach ($s in $summary) { Write-Host "  $s" }
 }
 
+# ---- What is installed on this machine (-ListClients and the end of an install) ----
+
+# The Google account of an install: the signed-in one (token.json), else GOOGLE_EMAIL.
+function Get-GoogleAccount([string]$Dir) {
+    $token = Join-Path $Dir 'token.json'
+    if (Test-Path $token) {
+        try {
+            $email = (Get-Content -Raw $token | ConvertFrom-Json).email
+            if ($email) { return "$email" }
+        } catch { }
+    }
+    $file = Join-Path $Dir "$AppName.env"
+    if (Test-Path $file) {
+        $wanted = Get-EnvValue $file 'GOOGLE_EMAIL'
+        if ($wanted) { return "$wanted (GOOGLE_EMAIL, not signed in)" }
+    }
+    return 'not signed in'
+}
+
+function Format-TaskState($Task) {
+    if (-not $Task) { return 'none' }
+    $next = (Get-ScheduledTaskInfo -InputObject $Task -ErrorAction SilentlyContinue).NextRunTime
+    $when = if ($next) { $next.ToString('yyyy-MM-dd HH:mm') } else { 'not scheduled' }
+    return "'$($Task.TaskName)' ($($Task.State)), next run $when"
+}
+
+# Every install on this machine. Returns @{ Entries = client names ('' = the default install, first);
+# TaskOf = client name -> scheduled task (case-insensitive keys) }.
+function Get-Installations {
+    $taskOf = @{}
+    foreach ($t in (Get-BackupTasks)) { $taskOf[(Get-ClientFromTaskName $t.TaskName)] = $t }
+    $folders = @()
+    if (Test-Path $ClientsDir) { $folders = @(Get-ChildItem -Directory -Path $ClientsDir | ForEach-Object { $_.Name }) }
+    $entries = New-Object 'System.Collections.Generic.List[string]'
+    if ((Test-Path (Get-InstallLayout '' $env:ProgramData).DataDir) -or $taskOf.ContainsKey('')) { $entries.Add('') }
+    foreach ($c in (Merge-ClientNames $folders @($taskOf.Keys | Where-Object { $_ }))) { $entries.Add($c) }
+    return @{ Entries = @($entries); TaskOf = $taskOf }
+}
+
+# The default install and every client: data folder, scheduled task with its next run, Google account.
+function Write-Installations {
+    $all = Get-Installations
+    Write-Host 'Installed on this machine:' -ForegroundColor Green
+    if ($all.Entries.Count -eq 0) { Write-Host '  nothing'; return }
+    foreach ($c in $all.Entries) {
+        $l = Get-InstallLayout $c $env:ProgramData
+        $folder = if (Test-Path $l.DataDir) { $l.DataDir } else { "$($l.DataDir) (missing)" }
+        Write-Host "  $($l.Label)" -ForegroundColor Cyan
+        Write-Host "    Data folder: $folder"
+        Write-Host "    Task:        $(Format-TaskState $all.TaskOf[$c])"
+        Write-Host "    Google:      $(Get-GoogleAccount $l.DataDir)"
+    }
+}
+
+# Each database belongs to one install: two installs backing up the same database would put one client's
+# data into another client's Drive, and give both SQL logins rights on it. Only installs with a scheduled task
+# count (a restore-only install never backs up).
+function Assert-NoSharedDatabases {
+    $all = Get-Installations
+    $others = @(foreach ($c in $all.Entries) {
+        if ($c -eq $Layout.Client -or -not $all.TaskOf.ContainsKey($c)) { continue }
+        $file = Join-Path (Get-InstallLayout $c $env:ProgramData).DataDir "$AppName.env"
+        if (-not (Test-Path $file)) { continue }
+        @{
+            Label     = (Get-InstallLayout $c $env:ProgramData).Label
+            Instance  = Get-EnvValue $file 'SQL_INSTANCE'
+            Databases = @(Split-DatabaseList (Get-EnvValue $file 'SQL_DATABASES'))
+        }
+    })
+    $mine = @(Split-DatabaseList (Get-EnvValue $EnvFile 'SQL_DATABASES'))
+    $shared = @(Get-DatabaseConflicts (Get-EnvValue $EnvFile 'SQL_INSTANCE') $mine $others)
+    if ($shared.Count) {
+        throw "Already backed up by another install on this SQL Server: $($shared -join ', '). Each database belongs to one client: remove it from SQL_DATABASES in $EnvFile."
+    }
+}
+
+# Without -Client on a machine that has only clients, the installer would create a brand-new default install
+# (new settings, key, Google sign-in, task). Ask first; a client's own server (no clients) never sees this.
+function Confirm-NewDefaultInstall {
+    if ($Layout.Client -or (Test-Path $EnvFile)) { return }
+    $clients = @((Get-Installations).Entries | Where-Object { $_ })
+    if ($clients.Count -eq 0) { return }
+    Write-Host "This machine has clients installed with -Client ($($clients -join ', ')), but no default install." -ForegroundColor Yellow
+    Write-Host 'Without -Client the installer now creates a NEW default install (new settings, key, Google account, task).' -ForegroundColor Yellow
+    Write-Host 'To update the program or one client, run the installer with -Client <name> instead.' -ForegroundColor Yellow
+    $answer = Read-Host 'Type DEFAULT to create a new default install, or press Enter to stop'
+    if ($answer -ne 'DEFAULT') { throw 'Nothing was changed. Run the installer with -Client <name>.' }
+}
+
+function Write-InstallSummary([switch]$NoTask) {
+    if ($Layout.Client) { Write-Host "  Client:      $($Layout.Client)" }
+    Write-Host "  Data folder: $DataDir"
+    Write-Host "  Settings:    $EnvFile"
+    Write-Host "  Logs:        $LogDir"
+    if (-not $NoTask) { Write-Host "  Task:        $TaskName" }
+    Write-Host "  Google:      $(Get-GoogleAccount $DataDir)"
+    $homeText = if ($Layout.Client) { " --home '$DataDir'" } else { '' }
+    Write-Host "  Check:       & '$Launcher'$homeText check"
+    Write-Host ''
+    Write-Installations
+}
+
 function Install-BackupManager {
     Write-Step '1/11 Checking prerequisites'
     Assert-Prerequisites
+    Write-Host "Installing the $($Layout.Label): data folder $DataDir, task '$TaskName'."
+    Confirm-NewDefaultInstall
 
     Write-Step '2/11 Getting the release package'
     $zip = Get-Package
@@ -1007,6 +1253,11 @@ function Install-BackupManager {
     Install-ProgramFiles $zip
 
     Write-Step "4/11 Settings ($EnvFile)"
+    if ($Layout.Client) {
+        # Always, also when it exists: it may have been created by hand (README, moving an install).
+        New-Item -ItemType Directory -Force -Path $ClientsDir | Out-Null
+        Lock-Folder $ClientsDir
+    }
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
     Lock-Folder $DataDir   # before any secret is written there
     Initialize-EnvFile
@@ -1019,6 +1270,7 @@ function Install-BackupManager {
     Lock-Folder $DataDir
 
     Write-Step '7/11 Preparing SQL Server'
+    if (-not $RestoreOnly) { Assert-NoSharedDatabases }
     if ($RestoreOnly) {
         Write-Host 'Skipped: a restore-only machine does not back up, so SQL Server is not prepared or checked.'
     } elseif ($SkipSqlSetup) {
@@ -1055,6 +1307,7 @@ function Install-BackupManager {
     if ($RestoreOnly) {
         Write-Host ''
         Write-Host 'Restore-only install: no scheduled task, no backup. See RESTORE.md.' -ForegroundColor Green
+        Write-InstallSummary -NoTask
         return
     }
 
@@ -1068,9 +1321,7 @@ function Install-BackupManager {
 
     Write-Host ''
     Write-Host 'backup-manager is installed and the first backup succeeded.' -ForegroundColor Green
-    Write-Host "  Settings: $EnvFile"
-    Write-Host "  Logs:     $LogDir"
-    Write-Host "  Check:    & '$Launcher' check"
+    Write-InstallSummary
 }
 
 # Resolve -ZipPath against the technician's folder before the working directory changes.
@@ -1085,7 +1336,25 @@ if ($ZipPath) {
 Push-Location $env:SystemRoot   # never sit inside the folder we replace
 $savedConsoleMode = Set-QuickEdit $false
 try {
-    Install-BackupManager
+    # -Client "" (e.g. an empty variable in a wrapper) is a mistake, not the default install. Under "irm | iex"
+    # there are no bound parameters.
+    $clientGiven = ($null -ne $PSBoundParameters) -and $PSBoundParameters.ContainsKey('Client')
+    if ($ListClients) {
+        if ($clientGiven) { throw '-ListClients lists every install: leave out -Client.' }
+        Assert-Prerequisites   # the data folders are readable by Administrators only
+        Write-Installations
+    } else {
+        if ($clientGiven -and -not $Client) { throw '-Client needs a name. Leave -Client out for the default install.' }
+        # Top level, not $script: (see the note at Get-BackupTasks).
+        $Layout         = Get-InstallLayout $Client $env:ProgramData
+        $TaskName       = $Layout.TaskName
+        $DataDir        = $Layout.DataDir
+        $EnvFile        = Join-Path $DataDir "$AppName.env"
+        $LogDir         = Join-Path $DataDir 'logs'
+        $HomeArgs       = $Layout.HomeArgs
+        $DefaultSqlUser = $Layout.DefaultSqlUser
+        Install-BackupManager
+    }
 } catch {
     Write-Host ''
     Write-Host "INSTALL STOPPED: $($_.Exception.Message)" -ForegroundColor Red

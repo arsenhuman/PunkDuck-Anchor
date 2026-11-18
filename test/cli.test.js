@@ -133,3 +133,45 @@ test('check --skip-sql works without SQL_PASSWORD (restore-only machine); a norm
   assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env: h.env, createSqlClient: okSql }), 1);
   assert.match(c.text, /SQL_PASSWORD is empty \(the installer fills it in when it creates the SQL login/);
 });
+
+test('--home <dir> picks the data folder and overrides BACKUP_MANAGER_HOME (install.ps1 -Client)', async () => {
+  const { default: fs } = await import('node:fs/promises');
+  const { default: path } = await import('node:path');
+  const h = await home();
+  await h.writeEnv();
+  const other = await home(); // no env file there
+  const env = { BACKUP_MANAGER_HOME: other.dir, BACKUP_MANAGER_OAUTH_CLIENT: h.env.BACKUP_MANAGER_OAUTH_CLIENT };
+
+  let c = capture();
+  assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env, createSqlClient: okSql }), 1);
+  assert.match(c.text, /cannot read .*backup-manager\.env/, 'without --home: BACKUP_MANAGER_HOME');
+
+  for (const argv of [['--home', h.dir, 'check', '--skip-auth'], ['check', '--skip-auth', '--home', h.dir], ['check', `--home=${h.dir}`, '--skip-auth'], ['--home', ` ${h.dir} `, 'check', '--skip-auth']]) {
+    c = capture();
+    assert.equal(await main(argv, { stdout: c.stdout, env, createSqlClient: okSql }), 0, `${argv.join(' ')}: ${c.text}`);
+    assert.match(c.text, /All checks passed/);
+  }
+
+  // Logs and the token go to the --home folder too.
+  await assert.rejects(main(['--home', h.dir, 'list'], { stdout: capture().stdout, env }), /auth login/);
+  assert.equal((await fs.readdir(path.join(h.dir, 'logs'))).length, 1);
+  await assert.rejects(fs.access(path.join(other.dir, 'logs')));
+  c = capture();
+  assert.equal(await main(['--home', h.dir, 'auth', 'logout'], { stdout: c.stdout, env }), 0);
+  assert.match(c.text, /Not logged in/);
+  assert.deepEqual(env, { BACKUP_MANAGER_HOME: other.dir, BACKUP_MANAGER_OAUTH_CLIENT: h.env.BACKUP_MANAGER_OAUTH_CLIENT }, 'the injected env is not modified');
+});
+
+test('--home needs a value', async () => {
+  for (const argv of [['--home', '', 'check'], ['--home=  ', 'check']]) {
+    const c = capture();
+    assert.equal(await main(argv, { stdout: c.stdout, logger: silentLogger }), 2);
+    assert.match(c.text, /--home needs a folder/);
+  }
+  const c = capture();
+  assert.equal(await main(['check', '--home'], { stdout: c.stdout, logger: silentLogger }), 2);
+  assert.match(c.text, /--home/);
+  const u = capture();
+  await main(['--help'], { stdout: u.stdout });
+  assert.match(u.text, /--home <dir>/);
+});
