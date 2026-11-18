@@ -180,10 +180,12 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninst
 
 ### SQL Server preparation
 
-**The installer does this for you** (step 7), connected with your Windows account. It doesn't use TCP/IP or a SQL
-login for this, so it works on a brand-new SQL Server Express. Your account must be a SQL Server **sysadmin**.
-If it isn't, the installer asks for a sysadmin SQL login instead (Enter for `sa`). That only works when mixed mode
-is already on. The password is kept in memory for step 7 only and never written to disk.
+**The installer does this for you** (step 7), connected as a SQL Server **sysadmin**. It tries, in order:
+`SQL_USER` / `SQL_PASSWORD` from the env file (only when both are set; used only if that login is a sysadmin, with a
+warning, since backups need just `db_backupoperator`), then your Windows account, then it asks for a sysadmin SQL
+login (Enter for `sa`) until one signs in; Ctrl+C stops it. Your Windows account doesn't use TCP/IP or a SQL login,
+so it works on a brand-new SQL Server Express. SQL logins only work when mixed mode is already on. The `sa` password
+is kept in memory for step 7 only and never written to disk.
 
 What it does, all safe to repeat:
 
@@ -229,7 +231,7 @@ It ends with a summary (login created/kept, databases, settings changed, restart
 nothing to change and does not ask again.
 
 **When you have no sysadmin access at all** (no Windows sysadmin account and no `sa` password; e.g. the client's
-DBA manages SQL Server), type `SKIP` at the login prompt and the installer stops at step 7. Then:
+DBA manages SQL Server), press Ctrl+C at the login prompt to stop the installer at step 7. Then:
 
 1. The DBA runs `C:\Program Files\backup-manager\sql-prepare.sql` in SSMS (it is commented; replace the login name,
    password and database name first) and enables mixed mode and TCP/IP if needed.

@@ -165,6 +165,23 @@ try {
     Remove-Item -LiteralPath $zipTmp, $shaTmp -ErrorAction SilentlyContinue
 }
 
+# ---- Get-SqlAdminSignInOrder ----
+Assert-Equal 'env windows prompt' ((Get-SqlAdminSignInOrder 'backup_user' 'pw') -join ' ') 'SQL_USER and SQL_PASSWORD set: try them first'
+Assert-Equal 'windows prompt' ((Get-SqlAdminSignInOrder '' '') -join ' ') 'nothing set: Windows, then the sa prompt'
+Assert-Equal 'windows prompt' ((Get-SqlAdminSignInOrder 'backup_user' '') -join ' ') 'SQL_USER without a password is not tried'
+Assert-Equal 'windows prompt' ((Get-SqlAdminSignInOrder '' 'pw') -join ' ') 'a password without SQL_USER is not tried'
+
+# ---- Connect-SqlAdminLogin cannot be skipped ----
+$adminFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Connect-SqlAdminLogin' }, $true)
+Assert-True ($adminFn -and $adminFn.Extent.Text -cnotmatch '\bSKIP\b') 'the sa prompt has no SKIP'
+Assert-True ($adminFn -and $adminFn.Extent.Text -notmatch '\bthrow\b') 'the sa prompt keeps asking instead of giving up'
+
+# ---- Get-QuickEditMode ----
+Assert-Equal ([uint32]0x1E7) (Get-QuickEditMode ([uint32]0x1A7) $true) 'QuickEdit on: 0x40 and 0x80 set'
+Assert-Equal ([uint32]0x1A7) (Get-QuickEditMode ([uint32]0x1E7) $false) 'QuickEdit off: 0x40 cleared, 0x80 kept'
+Assert-Equal ([uint32]0x87) (Get-QuickEditMode ([uint32]0x07) $false) 'QuickEdit off sets ENABLE_EXTENDED_FLAGS'
+Assert-Equal ([uint32]0x7) ((Get-QuickEditMode ([uint32]0x47) $true) -band [uint32]0x7) 'other mode bits are kept'
+
 # ---- ConvertTo-SqlInstanceName / Format-SqlInstanceNames ----
 Assert-Equal '' (ConvertTo-SqlInstanceName 'MSSQLSERVER') 'default instance is the empty SQL_INSTANCE'
 Assert-Equal 'SQLEXPRESS' (ConvertTo-SqlInstanceName 'MSSQL$SQLEXPRESS') 'named instance is the part after MSSQL$'

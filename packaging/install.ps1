@@ -59,9 +59,19 @@ function Write-Step([string]$Text) {
 
 # QuickEdit mode of the classic console: a click in the window starts a text selection, and while a
 # selection is active every write to the console blocks, so the installer looks frozen until a key is
-# pressed. Turn it off for the install and restore the technician's setting afterwards.
-# Returns the previous console mode, or $null when there is no classic console (nothing to restore).
-function Disable-QuickEdit {
+# pressed. It is off for the install and the technician's setting is restored afterwards. It is turned
+# on only while the installer shows something to copy (encryption key, Google sign-in link).
+
+# Console input mode with QuickEdit (0x40) on or off. ENABLE_EXTENDED_FLAGS (0x80) is always set,
+# or Windows ignores the QuickEdit bit.
+function Get-QuickEditMode([uint32]$Mode, [bool]$On) {
+    if ($On) { return [uint32](($Mode -bor [uint32]0x40) -bor [uint32]0x80) }
+    return [uint32](($Mode -band (-bnot [uint32]0x40)) -bor [uint32]0x80)
+}
+
+# Turn QuickEdit on or off. Returns the previous console mode, or $null when there is no classic
+# console (nothing to restore).
+function Set-QuickEdit([bool]$On) {
     try {
         if (-not ('PunkDuck.ConsoleMode' -as [type])) {
             Add-Type -Namespace PunkDuck -Name ConsoleMode -MemberDefinition @'
@@ -73,8 +83,7 @@ function Disable-QuickEdit {
         $handle = [PunkDuck.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
         $mode = [uint32]0
         if (-not [PunkDuck.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) { return $null }
-        # ENABLE_QUICK_EDIT_MODE = 0x40 off; ENABLE_EXTENDED_FLAGS = 0x80 on, or the change is ignored.
-        $new = ($mode -band (-bnot [uint32]0x40)) -bor [uint32]0x80
+        $new = Get-QuickEditMode $mode $On
         if (-not [PunkDuck.ConsoleMode]::SetConsoleMode($handle, $new)) { return $null }
         return $mode
     } catch {
@@ -87,6 +96,14 @@ function Restore-ConsoleMode($Mode) {
     try {
         [void][PunkDuck.ConsoleMode]::SetConsoleMode([PunkDuck.ConsoleMode]::GetStdHandle(-10), [uint32]$Mode)
     } catch { }
+}
+
+# Run $Body with mouse selection enabled, so the technician can copy what it shows. Selecting text
+# pauses console output; Enter copies the selection and ends it.
+function Invoke-WithQuickEdit([scriptblock]$Body) {
+    $before = Set-QuickEdit $true
+    Write-Host 'To copy: select the text with the mouse and press Enter (right-click pastes).' -ForegroundColor DarkGray
+    try { & $Body } finally { Restore-ConsoleMode $before }
 }
 
 # Run backup-manager.cmd with the console attached (needed for the interactive sign-in).
@@ -320,13 +337,17 @@ function Initialize-EncryptionKey {
     try {
         Set-Clipboard -Value $key -ErrorAction Stop
         Write-Host ' The key is also copied to the clipboard: paste it with Ctrl+V.' -ForegroundColor Yellow
-    } catch { }
+    } catch {
+        Write-Host ' Could not copy the key to the clipboard: select it with the mouse and press Enter.' -ForegroundColor Yellow
+    }
     Write-Host ' Store it NOW in the company password manager under this client.' -ForegroundColor Yellow
     Write-Host ' Without it, the backups of this machine can never be restored.' -ForegroundColor Yellow
     Write-Host '=====================================================================' -ForegroundColor Yellow
-    do {
-        $answer = Read-Host 'Type SAVED when the key is stored in the password manager'
-    } until ($answer -eq 'SAVED')
+    Invoke-WithQuickEdit {
+        do {
+            $answer = Read-Host 'Type SAVED when the key is stored in the password manager'
+        } until ($answer -eq 'SAVED')
+    }
 }
 
 function Register-BackupTask {
@@ -500,6 +521,15 @@ function Get-SqlLoginPlan([string]$User, [bool]$HasPassword, [bool]$LoginExists,
         Action  = 'error'
         Message = "The SQL login '$User' already exists, but SQL_PASSWORD is empty. Enter its password in SQL_PASSWORD, or empty SQL_USER to let the installer create its own login ($DefaultUser)."
     }
+}
+
+# Order in which step 7 tries to sign in to SQL Server as a sysadmin:
+#   env:     SQL_USER / SQL_PASSWORD from the env file (only when the technician filled in both)
+#   windows: the technician's Windows account
+#   prompt:  ask for a sysadmin login (sa) until one signs in
+function Get-SqlAdminSignInOrder([string]$EnvUser, [string]$EnvPassword) {
+    if ($EnvUser -and $EnvPassword) { return @('env', 'windows', 'prompt') }
+    return @('windows', 'prompt')
 }
 
 function Split-DatabaseList([string]$Value) {
@@ -696,38 +726,75 @@ function Write-SqlPrepareHelp {
     Write-Host 'Then run the installer again with -SkipSqlSetup (see README, "SQL Server preparation").' -ForegroundColor Yellow
 }
 
-# Fallback when the technician's Windows account is not a SQL Server sysadmin: sign in with a SQL login
-# such as sa (the Mersoft setup usually creates one). Only works when mixed mode is already on.
-# Returns the $SqlWhoAmI row; sets $script:SqlAdminCredential for the rest of step 7.
+# Sign in to SQL Server with a SQL login. Prints nothing. Returns @{ Me; Error; SignInFailed }:
+# Me is the $SqlWhoAmI row when the login is a sysadmin, and $script:SqlAdminCredential stays set for
+# the rest of step 7; otherwise the credential is cleared and Error says why. Needs mixed mode on.
+function Connect-SqlLogin([hashtable]$Inst, [string]$Name, [System.Security.SecureString]$Password) {
+    try {
+        $Password.MakeReadOnly()
+        $script:SqlAdminCredential = New-Object System.Data.SqlClient.SqlCredential -ArgumentList $Name, $Password
+        $me = @(Invoke-SqlAdmin -DataSource $Inst.DataSource -Sql $SqlWhoAmI)[0]
+    } catch {
+        $script:SqlAdminCredential = $null
+        return @{ Me = $null; Error = "could not sign in as $Name`: $($_.Exception.Message)"; SignInFailed = $true }
+    }
+    if ($me.is_sysadmin -eq 1) { return @{ Me = $me; Error = $null; SignInFailed = $false } }
+    $script:SqlAdminCredential = $null
+    return @{ Me = $null; Error = "$Name is not a sysadmin on this SQL Server"; SignInFailed = $false }
+}
+
+# 1st choice when SQL_USER and SQL_PASSWORD are both filled in: use that login if it is a sysadmin.
+function Connect-SqlEnvLogin([hashtable]$Inst, [string]$User, [string]$Password) {
+    $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    $r = Connect-SqlLogin $Inst $User $secure
+    $me = $r.Me
+    if (-not $me) {
+        Write-Host "SQL_USER cannot prepare SQL Server ($($r.Error)); trying your Windows account." -ForegroundColor Yellow
+        return $null
+    }
+    Write-Host "WARNING: SQL_USER ($User) is a SQL Server sysadmin. The nightly backups only need" -ForegroundColor Yellow
+    Write-Host '  db_backupoperator; consider a login with fewer rights (empty SQL_USER and SQL_PASSWORD' -ForegroundColor Yellow
+    Write-Host '  and the installer creates one). The login is not changed.' -ForegroundColor Yellow
+    return $me
+}
+
+# 2nd choice: the technician's Windows account.
+function Connect-SqlWindows([hashtable]$Inst) {
+    $script:SqlAdminCredential = $null
+    try {
+        $me = @(Invoke-SqlAdmin -DataSource $Inst.DataSource -Sql $SqlWhoAmI)[0]
+    } catch {
+        Write-Host "Could not connect to SQL Server ($($Inst.DataSource)) with your Windows account: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+    if ($me.is_sysadmin -eq 1) { return $me }
+    Write-Host "Your Windows account ($($me.login_name)) is not a sysadmin on this SQL Server." -ForegroundColor Yellow
+    return $null
+}
+
+# Last resort: ask for a SQL Server sysadmin login such as sa (the Mersoft setup usually creates one)
+# until one signs in. There is no way to skip it; Ctrl+C stops the installer.
 function Connect-SqlAdminLogin([hashtable]$Inst) {
     Write-Host ''
-    Write-Host 'You can sign in with a SQL Server sysadmin login instead (usually sa).' -ForegroundColor Yellow
+    Write-Host 'Sign in with a SQL Server sysadmin login instead (usually sa).' -ForegroundColor Yellow
     Write-Host 'It is used only during this step and is not saved.' -ForegroundColor Yellow
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $name = "$(Read-Host 'SQL Server sysadmin login (Enter for sa, or type SKIP to stop)')".Trim()
-        if ($name -eq 'SKIP') { break }
+    Write-Host 'No sysadmin password? Press Ctrl+C to stop the installer.' -ForegroundColor Yellow
+    Write-SqlPrepareHelp
+    while ($true) {
+        $name = "$(Read-Host 'SQL Server sysadmin login (Enter for sa)')".Trim()
         if (-not $name) { $name = 'sa' }
         if (-not (Test-SqlLoginName $name)) {
             Write-Host "'$name' is not a SQL login name (DOMAIN\user is a Windows account)." -ForegroundColor Red
             continue
         }
         $pw = Read-Host "Password for $name" -AsSecureString
-        $pw.MakeReadOnly()
-        $script:SqlAdminCredential = New-Object System.Data.SqlClient.SqlCredential -ArgumentList $name, $pw
-        try {
-            $me = @(Invoke-SqlAdmin -DataSource $Inst.DataSource -Sql $SqlWhoAmI)[0]
-        } catch {
-            $script:SqlAdminCredential = $null
-            Write-Host "Could not sign in as $name`: $($_.Exception.Message)" -ForegroundColor Red
+        $r = Connect-SqlLogin $Inst $name $pw
+        if ($r.Me) { return $r.Me }
+        Write-Host "$($r.Error)." -ForegroundColor Red
+        if ($r.SignInFailed) {
             Write-Host 'Wrong password, the login is disabled, or SQL Server accepts only Windows sign-in (mixed mode off).' -ForegroundColor Yellow
-            continue
         }
-        if ($me.is_sysadmin -eq 1) { return $me }
-        $script:SqlAdminCredential = $null
-        Write-Host "$name is not a sysadmin on this SQL Server." -ForegroundColor Red
     }
-    Write-SqlPrepareHelp
-    throw 'SQL Server preparation needs a SQL Server sysadmin.'
 }
 
 # Step 7. Idempotent: running it again changes only what is still missing.
@@ -773,18 +840,17 @@ function Initialize-SqlServer {
         if (-not (Wait-SqlServer $inst.DataSource 90)) { throw "SQL Server ($($inst.ServiceName)) did not start." }
     }
 
-    # 2. Connect as a sysadmin: the technician's Windows account, else a SQL login such as sa
+    # 2. Connect as a sysadmin: SQL_USER/SQL_PASSWORD, else the technician's Windows account,
+    #    else a SQL login such as sa (see Get-SqlAdminSignInOrder)
     $me = $null
-    try {
-        $me = @(Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlWhoAmI)[0]
-        if ($me.is_sysadmin -ne 1) {
-            Write-Host "Your Windows account ($($me.login_name)) is not a sysadmin on this SQL Server." -ForegroundColor Yellow
-            $me = $null
+    foreach ($way in (Get-SqlAdminSignInOrder (Get-EnvValue $EnvFile 'SQL_USER') $password)) {
+        switch ($way) {
+            'env'     { $me = Connect-SqlEnvLogin $inst $login $password }
+            'windows' { $me = Connect-SqlWindows $inst }
+            'prompt'  { $me = Connect-SqlAdminLogin $inst }
         }
-    } catch {
-        Write-Host "Could not connect to SQL Server ($($inst.DataSource)) with your Windows account: $($_.Exception.Message)" -ForegroundColor Yellow
+        if ($me) { break }
     }
-    if (-not $me) { $me = Connect-SqlAdminLogin $inst }
     Write-Host "Connected to $($inst.InstanceName) as $($me.login_name) (sysadmin)."
 
     # 3. Databases: all must exist, be ONLINE and writable before anything is created
@@ -978,7 +1044,8 @@ function Install-BackupManager {
 
     Write-Step '9/11 Google sign-in'
     if ((Invoke-App auth status) -ne 0) {
-        if ((Invoke-App auth login) -ne 0) { throw 'Google sign-in failed.' }
+        $rc = Invoke-WithQuickEdit { Invoke-App auth login }
+        if ($rc -ne 0) { throw 'Google sign-in failed.' }
     }
     # Full check, now including Google: stops if the wrong account was signed in (GOOGLE_EMAIL).
     if ((Invoke-App check @skipSql) -ne 0) {
@@ -1016,7 +1083,7 @@ if ($ZipPath) {
 }
 
 Push-Location $env:SystemRoot   # never sit inside the folder we replace
-$savedConsoleMode = Disable-QuickEdit
+$savedConsoleMode = Set-QuickEdit $false
 try {
     Install-BackupManager
 } catch {
