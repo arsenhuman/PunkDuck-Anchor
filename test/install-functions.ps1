@@ -107,9 +107,15 @@ Assert-Equal 1000 $seen.Count '1000 distinct valid passwords'
 Assert-Equal 8 (New-SqlLoginPassword 8).Length 'custom length'
 
 # ---- Select-SqlWmiNamespace ----
-Assert-Equal 'root\Microsoft\SqlServer\ComputerManagement17' (Select-SqlWmiNamespace @('ServerEvents', 'ComputerManagement13', 'ComputerManagement17', 'ComputerManagement15')) 'newest namespace'
-Assert-True ($null -eq (Select-SqlWmiNamespace @('ServerEvents'))) 'no ComputerManagement namespace'
-Assert-True ($null -eq (Select-SqlWmiNamespace @())) 'no namespaces'
+$ns = @(Select-SqlWmiNamespace @('ServerEvents', 'ComputerManagement13', 'ComputerManagement17', 'ComputerManagement15'))
+Assert-Equal 3 $ns.Count 'all ComputerManagement namespaces'
+Assert-Equal 'root\Microsoft\SqlServer\ComputerManagement17' $ns[0] 'newest first'
+Assert-Equal 'root\Microsoft\SqlServer\ComputerManagement15' $ns[1] 'then the next'
+Assert-Equal 'root\Microsoft\SqlServer\ComputerManagement13' $ns[2] 'oldest last'
+Assert-Equal 2 @(Select-SqlWmiNamespace @('ComputerManagement9', 'ComputerManagement13')).Count 'numeric, not text, order'
+Assert-Equal 'root\Microsoft\SqlServer\ComputerManagement13' @(Select-SqlWmiNamespace @('ComputerManagement9', 'ComputerManagement13'))[0] '13 is newer than 9'
+Assert-Equal 0 @(Select-SqlWmiNamespace @('ServerEvents')).Count 'no ComputerManagement namespace'
+Assert-Equal 0 @(Select-SqlWmiNamespace @()).Count 'no namespaces'
 
 # ---- Get-TcpPortPlan ----
 $p = Get-TcpPortPlan '' '1433'

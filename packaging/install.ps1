@@ -473,14 +473,12 @@ function New-SqlLoginPassword([int]$Length = 32) {
     }
 }
 
-# Newest SQL Server WMI provider namespace (ComputerManagement13 = 2016 ... 17 = 2025), or $null.
+# SQL Server WMI provider namespaces (ComputerManagement13 = 2016 ... 17 = 2025), newest first.
+# All of them, not just the newest: another SQL Server version (or its leftovers) can leave a newer
+# namespace that does not serve this instance or is not registered at all ("Invalid class").
 function Select-SqlWmiNamespace([string[]]$Names) {
-    $best = -1
-    foreach ($n in $Names) {
-        if ($n -match '^ComputerManagement(\d+)$' -and [int]$Matches[1] -gt $best) { $best = [int]$Matches[1] }
-    }
-    if ($best -lt 0) { return $null }
-    return "root\Microsoft\SqlServer\ComputerManagement$best"
+    $versions = @(foreach ($n in $Names) { if ($n -match '^ComputerManagement(\d+)$') { [int]$Matches[1] } })
+    return @($versions | Sort-Object -Descending -Unique | ForEach-Object { "root\Microsoft\SqlServer\ComputerManagement$_" })
 }
 
 # Default instance: what to do with the IPAll TcpPort. Returns @{ Action = 'set' | 'keep' | 'adopt'; Port }.
@@ -569,9 +567,33 @@ function Get-SqlWmiNamespace {
     try {
         $names = @(Get-CimInstance -Namespace 'root\Microsoft\SqlServer' -ClassName '__NAMESPACE' -ErrorAction Stop | ForEach-Object { $_.Name })
     } catch {
-        return $null
+        return @()
     }
     return Select-SqlWmiNamespace $names
+}
+
+# The first namespace (newest first) whose provider lists TCP/IP for the instance.
+# Returns @{ Namespace; Tcp }, or $null after printing what each namespace answered.
+function Find-SqlTcpProtocol([hashtable]$Inst) {
+    $namespaces = @(Get-SqlWmiNamespace)
+    if ($namespaces.Count -eq 0) {
+        Write-Host 'The SQL Server WMI provider (used by SQL Server Configuration Manager) was not found.' -ForegroundColor Red
+        return $null
+    }
+    $tried = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($ns in $namespaces) {
+        try {
+            $tcp = Get-SqlTcpProtocol $ns $Inst.InstanceName
+        } catch {
+            $tried.Add("$ns`: $($_.Exception.Message)")
+            continue
+        }
+        if ($tcp) { return @{ Namespace = $ns; Tcp = $tcp } }
+        $tried.Add("$ns`: no TCP/IP entry for $($Inst.InstanceName)")
+    }
+    Write-Host "No SQL Server WMI namespace lists TCP/IP for $($Inst.InstanceName):" -ForegroundColor Red
+    foreach ($t in $tried) { Write-Host "  $t" -ForegroundColor Red }
+    return $null
 }
 
 function Get-SqlTcpProtocol([string]$Namespace, [string]$InstanceName) {
@@ -784,18 +806,13 @@ function Initialize-SqlServer {
     $mixedOff = (Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlIntegratedOnly -Scalar) -eq 1
     if ($mixedOff) { $changes.Add('Enable "SQL Server and Windows Authentication mode" (mixed mode)') }
 
-    $ns = Get-SqlWmiNamespace
-    if (-not $ns) {
-        Write-Host 'The SQL Server WMI provider (used by SQL Server Configuration Manager) was not found.' -ForegroundColor Red
+    $found = Find-SqlTcpProtocol $inst
+    if (-not $found) {
         Write-ManualTcpHelp $inst
         throw 'Cannot check the TCP/IP settings automatically.'
     }
-    $tcp = Get-SqlTcpProtocol $ns $inst.InstanceName
-    if (-not $tcp) {
-        Write-Host "No TCP/IP protocol entry for $($inst.InstanceName) in $ns." -ForegroundColor Red
-        Write-ManualTcpHelp $inst
-        throw 'Cannot check the TCP/IP settings automatically.'
-    }
+    $ns = $found.Namespace
+    $tcp = $found.Tcp
     if (-not $tcp.Enabled) { $changes.Add("Enable TCP/IP for $($inst.InstanceName)") }
 
     $portPlan = $null
