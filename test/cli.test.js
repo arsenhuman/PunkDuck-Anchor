@@ -146,7 +146,7 @@ test('--home <dir> picks the data folder and overrides BACKUP_MANAGER_HOME (inst
   assert.equal(await main(['check', '--skip-auth'], { stdout: c.stdout, env, createSqlClient: okSql }), 1);
   assert.match(c.text, /cannot read .*backup-manager\.env/, 'without --home: BACKUP_MANAGER_HOME');
 
-  for (const argv of [['--home', h.dir, 'check', '--skip-auth'], ['check', '--skip-auth', '--home', h.dir], ['check', `--home=${h.dir}`, '--skip-auth']]) {
+  for (const argv of [['--home', h.dir, 'check', '--skip-auth'], ['check', '--skip-auth', '--home', h.dir], ['check', `--home=${h.dir}`, '--skip-auth'], ['--home', ` ${h.dir} `, 'check', '--skip-auth']]) {
     c = capture();
     assert.equal(await main(argv, { stdout: c.stdout, env, createSqlClient: okSql }), 0, `${argv.join(' ')}: ${c.text}`);
     assert.match(c.text, /All checks passed/);

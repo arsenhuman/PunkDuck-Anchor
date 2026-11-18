@@ -46,7 +46,9 @@ $ClientsDir = Join-Path $env:ProgramData "$AppName-clients"
 # Copies of the functions in install.ps1 (this script runs without it). test/install-functions.ps1
 # checks that both copies give the same answers.
 function Test-ClientName([string]$Name) {
-    return [bool]($Name -cmatch '^[A-Za-z0-9_-]{1,32}\z')
+    if (-not ($Name -cmatch '^[A-Za-z0-9_-]{1,32}\z')) { return $false }
+    if ($Name -match '^(user|con|prn|aux|nul|com[0-9]|lpt[0-9])\z') { return $false }
+    return $true
 }
 
 function Get-ClientFromTaskName([string]$TaskName) {
@@ -118,7 +120,8 @@ try {
         Write-Host "The SQL login of client $Client (SQL_USER) was not dropped; drop it in SSMS if it is no longer needed."
     } else {
         # ---- Default install and the shared program files: only when no client has a task left. ----
-        $clients = @(Get-ScheduledTask -TaskPath '\' -ErrorAction SilentlyContinue |
+        # -ErrorAction Stop: if Task Scheduler cannot be queried, stop instead of removing files clients still use.
+        $clients = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -eq '\' } |
             ForEach-Object { Get-ClientFromTaskName $_.TaskName } | Where-Object { $_ })
         if ($clients.Count) {
             Write-Host 'These clients are still installed on this machine and use the program files:' -ForegroundColor Red
@@ -148,7 +151,7 @@ try {
         if (Test-Path $ClientsDir) {
             $kept = @(Get-ChildItem -Directory -Path $ClientsDir | ForEach-Object { $_.Name })
             if ($kept.Count) {
-                Write-Host "Kept the data folders of uninstalled clients in $ClientsDir`: $($kept -join ', ')." -ForegroundColor Yellow
+                Write-Host "Kept the data folders of clients without a scheduled task (uninstalled or restore-only) in $ClientsDir`: $($kept -join ', ')." -ForegroundColor Yellow
                 Write-Host '  Delete them by hand if they are no longer needed; revoke their Google sign-ins at' -ForegroundColor Yellow
                 Write-Host '  https://myaccount.google.com/permissions (the encryption keys are in the password manager).' -ForegroundColor Yellow
             }

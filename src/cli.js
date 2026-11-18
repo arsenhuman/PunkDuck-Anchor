@@ -111,11 +111,12 @@ export async function main(argv, {
   }
   const { values: opts, positionals } = parsed;
   if (opts.home !== undefined) {
-    if (!opts.home.trim()) {
+    const home = opts.home.trim();
+    if (!home) {
       stdout.write(`--home needs a folder\n\n${USAGE}`);
       return 2;
     }
-    env = { ...env, BACKUP_MANAGER_HOME: opts.home };
+    env = { ...env, BACKUP_MANAGER_HOME: home };
   }
   const [cmd, sub] = positionals;
   if (opts.help || !cmd) {

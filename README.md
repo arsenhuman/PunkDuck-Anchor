@@ -136,7 +136,9 @@ irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/download/v1.2.0/insta
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version 1.2.0
 ```
 
-Installer options (they need the `-File` form, not `irm | iex`):
+Installer options (they need the `-File` form, or the one-line form
+`& ([scriptblock]::Create((irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1))) -Client acme`;
+plain `irm | iex` takes no options and always works on the default install):
 
 | Option | Use |
 | --- | --- |
@@ -144,7 +146,7 @@ Installer options (they need the `-File` form, not `irm | iex`):
 | `-ZipPath .\backup-manager-1.2.0-win-x64.zip` | Offline install when GitHub is blocked: copy the zip **and** its `.sha256` into the same folder first |
 | `-RestoreOnly` | Restore machine for another client's backups: no SQL Server preparation or SQL checks, no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
 | `-SkipSqlSetup` | Don't touch SQL Server (the client's DBA manages it): the DBA runs `sql-prepare.sql` instead, see *SQL Server preparation* |
-| `-Client acme` | Install or update the client `acme` on a machine that backs up several clients: own data folder, key, Google account, task and SQL login. Letters, digits, `-`, `_`, at most 32. See *Several clients on one machine* |
+| `-Client acme` | Install or update the client `acme` on a machine that backs up several clients: own data folder, key, Google account, task and SQL login. Letters, digits, `-`, `_`, at most 32; not `user` or a Windows device name (`con`, `nul`, `com1`, ...). See *Several clients on one machine* |
 | `-ListClients` | Only list what is installed here (default install and every client: data folder, task, next run, Google account) and exit |
 
 The installer:
@@ -158,7 +160,7 @@ The installer:
 5. If `BACKUP_ENCRYPTION_KEY` is empty, generates a key, writes it into the env file, copies it to the clipboard
    and **shows it once**.
    **Store it in the company password manager** under the client, then type `SAVED`.
-6. Locks both folders down to SYSTEM and Administrators.
+6. Locks both folders down to SYSTEM and Administrators (also makes Administrators their owner).
 7. **Prepares SQL Server** (see *SQL Server preparation*): SQL login, permissions, SQL Browser, and, only after you
    type `RESTART`, mixed mode and TCP/IP.
 8. Runs `backup-manager check` (without the Google part). On failure it stops with a plain-language explanation.
@@ -166,7 +168,7 @@ The installer:
 9. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*), then the full
    `check` again. It stops if the signed-in account is not `GOOGLE_EMAIL`.
 10. Registers or updates the scheduled task "PunkDuck Backup Manager" (with `-Client X`: "PunkDuck Backup Manager (X)",
-    which runs `backup-manager.cmd --home <client folder> backup`): daily at `BACKUP_TIME`, as SYSTEM with highest
+    which runs `backup-manager.cmd --home <client folder> backup`, the folder quoted only if it contains spaces): daily at `BACKUP_TIME`, as SYSTEM with highest
     privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs. It warns when
     another install's task starts at the same minute.
 11. Runs the first backup and prints the result, then a summary (client, data folder, task, Google account) and
@@ -196,8 +198,15 @@ uninstaller.
 
 ### Several clients on one machine
 
-One machine and one SQL Server can back up several clients, each to **its own** Google Drive. Install the first
-client normally (or with `-Client`), every further one with `-Client <name>`:
+One machine and one SQL Server can back up several clients, each to **its own** Google Drive. This is meant for
+**our own servers** that host several clients. A client with its own server keeps the normal install (`irm | iex`,
+no `-Client`), which works exactly as before. Install the first client normally (or with `-Client`), every further
+one with `-Client <name>`, either from a downloaded `install.ps1` (`-File`) or in one line:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+& ([scriptblock]::Create((irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1))) -Client acme
+```
 
 | | Default install | `-Client acme` |
 | --- | --- | --- |
@@ -212,8 +221,16 @@ client normally (or with `-Client`), every further one with `-Client <name>`:
 - Each client has its own env file, so `SQL_DATABASES`, `GOOGLE_EMAIL`, `HEALTHCHECK_URL`, `SERVER_NAME` and
   `BACKUP_TIME` are per client. Each client's SQL login gets `db_backupoperator` only in that client's databases.
   Server-wide settings (mixed mode, TCP/IP, port) are changed at most once; later clients find them done.
+- **Each database belongs to one install.** The installer stops if `SQL_DATABASES` lists a database that another
+  install with a scheduled task on the same instance already backs up.
 - Give each client its own `BACKUP_TIME` (e.g. 30 minutes apart) so their backups don't compete for the disk.
 - `install.ps1 -ListClients` shows everything installed on the machine.
+- **Update** by running the installer for any one existing install: its `-Client` name, or no `-Client` if the
+  machine has a default install. On a machine with only clients, running it without `-Client` would create a new
+  default install; the installer asks you to type `DEFAULT` first.
+- **What separates clients:** their settings, keys, Google sign-ins, tasks and SQL logins. It is a separation of
+  configuration, not a security boundary: every task runs as SYSTEM and every data folder is readable by SYSTEM
+  and Administrators, so an administrator of the machine can read every client's files.
 - Moving an existing default install to a client is not automated. By hand, before any client is installed:
   run `uninstall.ps1` **without** `-Purge` (removes the task and the program files, keeps the data), create
   `C:\ProgramData\backup-manager-clients\<name>\`, copy `backup-manager.env` and `token.json` from
@@ -545,12 +562,22 @@ Token file contents: `{ "refresh_token", "scope", "email", "createdAt" }`. No ac
 
 - **Nothing in `src/` knows about clients.** The installer gives each client its own data folder and passes it as
   `--home <dir>` (`src/cli.js` sets `BACKUP_MANAGER_HOME` from it for that run only): in the scheduled task's
-  arguments and in every `Invoke-App` call of the install. There is no machine-wide environment variable, so two
-  clients can never read each other's env file or token.
+  arguments and in every `Invoke-App` call of the install. There is no machine-wide environment variable, so one
+  client's run never picks up another client's settings or token. This separates configuration only: all tasks run
+  as SYSTEM, which can read every data folder.
 - **`Get-InstallLayout`** (pure, tested) maps `-Client` to the data folder, task name, default SQL login, `--home`
   arguments and task arguments. `''` gives exactly the paths and names of an install without `-Client`.
-  `Use-InstallLayout` copies them into the script variables (`$DataDir`, `$EnvFile`, `$TaskName`, ...) the rest of
-  `install.ps1` uses.
+  The bottom of `install.ps1` copies them into the variables (`$DataDir`, `$EnvFile`, `$TaskName`, ...) the rest of
+  the script uses, **at the top level, never with `$script:`**: under `& ([scriptblock]::Create((irm ...)))` a
+  `$script:` variable is a different variable. `test/install-functions.ps1` checks this and that no parameter is
+  mandatory (`irm | iex` binds none).
+- **Shared databases:** `Assert-NoSharedDatabases` (helper `Get-DatabaseConflicts`, tested) stops step 7 when another
+  install with a task backs up the same database on the same instance.
+- **Folder owner:** `Lock-Folder` makes Administrators the owner (`icacls /setowner`) before it replaces the ACL, so a
+  folder created in advance by another user can't be reopened by its owner. `backup-manager-clients` is locked on
+  every client install.
+- **Task arguments** quote the folder only when it contains spaces or cmd.exe special characters: the task runs a
+  `.cmd`, and cmd.exe strips quotes differently when a command line has more than two.
 - **Client data lives in `C:\ProgramData\backup-manager-clients\`**, not below `C:\ProgramData\backup-manager`, so
   `uninstall.ps1 -Purge` of the default install can never delete it.
 - **Task names identify installs:** `Get-ClientFromTaskName` maps `PunkDuck Backup Manager` to `''`, `PunkDuck
@@ -558,7 +585,11 @@ Token file contents: `{ "refresh_token", "scope", "email", "createdAt" }`. No ac
   `uninstall.ps1` without `-Client` refuses while any client task exists. `uninstall.ps1` carries its own copies of
   `Test-ClientName` and `Get-ClientFromTaskName`; `test/install-functions.ps1` checks they agree with `install.ps1`.
 - **Client names** (`Test-ClientName`): `^[A-Za-z0-9_-]{1,32}\z`, case-sensitive match so no Unicode case folding
-  lets other characters in. Safe as a folder name, inside a task name and in the SQL login `backup_<name>`.
+  lets other characters in. Safe as a folder name, inside a task name and in the SQL login `backup_<name>`. Refused
+  in any case: `user` (its login would be `backup_user`, the default install's) and Windows device names (`con`,
+  `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`).
+- **`-Client ""`** is an error (a wrapper with an empty variable), not the default install; `-ListClients` with
+  `-Client` is an error too.
 
 ### Encrypted file format
 

@@ -178,6 +178,7 @@ The installer prints **INSTALL STOPPED:** in red with the reason. Fix it and run
 | `Could not sign in as sa` | Wrong password, `sa` disabled, or SQL Server accepts only Windows sign-in. See section 7 |
 | `... is not a sysadmin` | See section 7 |
 | `The Google check failed` / wrong account | You signed in with the wrong Google account. Run the two `auth` commands below, then the installer again |
+| `Already backed up by another install` | That database belongs to another client on this server. Remove it from `SQL_DATABASES` in this client's settings file |
 | `A backup is running right now` | Wait until it finishes, then run the installer again. With several clients (section 8), any client's backup blocks it |
 | The window looks frozen | Window title starts with "Select"? Press **Esc** |
 | `Could not create SSL/TLS secure channel` | You ran only the second line of the command. Run both lines |
@@ -250,16 +251,20 @@ settings, encryption key, SQL login and nightly task.
 
 1. The first client: install it as in section 4 (the normal install), **or** already with a name as below.
 2. Every further client: install it with **`-Client <name>`**. The name: letters, digits, `-` and `_`, no spaces,
-   at most 32 characters (e.g. `acme`, `bakery-2`).
+   at most 32 characters (e.g. `acme`, `bakery-2`). Not allowed: `user`, `con`, `nul`, `prn`, `aux`, `com1`...,
+   `lpt1`....
 
    ```powershell
    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
-   irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 -OutFile install.ps1
-   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Client acme
+   & ([scriptblock]::Create((irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1))) -Client acme
    ```
 
+   (The usual `irm ... | iex` can't take `-Client`; this line can. Or download `install.ps1` with
+   `irm ... -OutFile install.ps1` and run `powershell -ExecutionPolicy Bypass -File .\install.ps1 -Client acme`.)
+
    The 11 steps are the same as in section 4. The settings file that opens in Notepad is **only this client's**:
-   enter **only this client's databases** and **this client's Gmail**.
+   enter **only this client's databases** and **this client's Gmail**. A database can belong to only one client:
+   the installer stops if another client already backs it up.
 
 **For every client, separately:**
 
@@ -289,11 +294,13 @@ $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
 **What is installed on this server?**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -ListClients
+& ([scriptblock]::Create((irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1))) -ListClients
 ```
 
-**Update:** run the installer once, with or without `-Client`: the program is shared, so all clients are updated.
-It refuses while any client's backup is running.
+**Update:** run the installer once for **one existing install**: with `-Client <name>` of any client, or without
+`-Client` if the server has a normal install too. The program is shared, so all clients are updated. It refuses while
+any client's backup is running. On a server with only clients, running it without `-Client` would start a **new**
+normal install; the installer asks you to type `DEFAULT` first. Press Enter there to stop.
 
 **Uninstall one client** (the others keep working):
 
