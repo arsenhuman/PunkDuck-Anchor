@@ -68,6 +68,32 @@ Assert-Equal 2 $dbs.Count 'two databases'
 Assert-Equal 'HR' $dbs[1] 'trimmed name'
 Assert-Equal 0 (Split-DatabaseList '').Count 'empty list'
 
+# ---- Test-SupportedWindows ----
+Assert-True (Test-SupportedWindows 10 19045 1 'AMD64') 'Windows 10 x64'
+Assert-True (Test-SupportedWindows 10 22631 1 'AMD64') 'Windows 11 x64'
+Assert-True (Test-SupportedWindows 10 14393 3 'AMD64') 'Windows Server 2016'
+Assert-True (Test-SupportedWindows 10 26100 3 'AMD64') 'Windows Server 2025'
+Assert-True (Test-SupportedWindows 10 17763 2 'AMD64') 'Windows Server 2019 domain controller'
+Assert-True (-not (Test-SupportedWindows 6 9600 3 'AMD64')) 'Windows Server 2012 R2 is not supported (Node 22)'
+Assert-True (-not (Test-SupportedWindows 10 10240 3 'AMD64')) 'server build before 2016 is not supported'
+Assert-True (-not (Test-SupportedWindows 10 19045 1 'x86')) '32-bit is not supported'
+Assert-True (-not (Test-SupportedWindows 10 22631 1 'ARM64')) 'ARM64 is not supported'
+
+# ---- Get-SqlLoginPlan ----
+$p = Get-SqlLoginPlan 'backup_user' $false $false
+Assert-Equal 'create' $p.Action 'both empty (default name), no login: create'
+Assert-True $p.GeneratePassword 'both empty: generated password'
+$p = Get-SqlLoginPlan 'app_backup' $true $false
+Assert-Equal 'create' $p.Action 'given user + password, no login: create'
+Assert-True (-not $p.GeneratePassword) 'given password is used, not generated'
+Assert-True (Get-SqlLoginPlan 'app_backup' $false $false).GeneratePassword 'given user, no password, no login: generated password'
+Assert-Equal 'use' (Get-SqlLoginPlan 'app_backup' $true $true).Action 'existing login with password: use it unchanged'
+Assert-Equal 'use' (Get-SqlLoginPlan 'backup_user' $true $true).Action 'default login with password: use it'
+Assert-Equal 'reset' (Get-SqlLoginPlan 'backup_user' $false $true).Action 'own default login without password: reset'
+$p = Get-SqlLoginPlan 'sa' $false $true
+Assert-Equal 'error' $p.Action 'existing foreign login without password: never reset its password'
+Assert-True ($p.Message -match 'SQL_PASSWORD') 'error names SQL_PASSWORD'
+
 # ---- New-SqlLoginPassword ----
 $seen = @{}
 for ($n = 0; $n -lt 1000; $n++) {

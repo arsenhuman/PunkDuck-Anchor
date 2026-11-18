@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Install or update PunkDuck backup-manager on Windows 10/11 x64.
+    Install or update PunkDuck backup-manager on Windows 10/11 or Windows Server 2016+ (x64).
 
 .DESCRIPTION
     Run in Windows PowerShell 5.1 as Administrator. Safe to run again: an update replaces only
@@ -22,6 +22,7 @@
     manages SQL Server: the DBA runs sql-prepare.sql from the program folder instead.
 
 .EXAMPLE
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
     irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
 
 .EXAMPLE
@@ -52,6 +53,38 @@ $Launcher   = Join-Path $InstallDir "$AppName.cmd"
 function Write-Step([string]$Text) {
     Write-Host ''
     Write-Host "==> $Text" -ForegroundColor Cyan
+}
+
+# QuickEdit mode of the classic console: a click in the window starts a text selection, and while a
+# selection is active every write to the console blocks, so the installer looks frozen until a key is
+# pressed. Turn it off for the install and restore the technician's setting afterwards.
+# Returns the previous console mode, or $null when there is no classic console (nothing to restore).
+function Disable-QuickEdit {
+    try {
+        if (-not ('PunkDuck.ConsoleMode' -as [type])) {
+            Add-Type -Namespace PunkDuck -Name ConsoleMode -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $handle = [PunkDuck.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        $mode = [uint32]0
+        if (-not [PunkDuck.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) { return $null }
+        # ENABLE_QUICK_EDIT_MODE = 0x40 off; ENABLE_EXTENDED_FLAGS = 0x80 on, or the change is ignored.
+        $new = ($mode -band (-bnot [uint32]0x40)) -bor [uint32]0x80
+        if (-not [PunkDuck.ConsoleMode]::SetConsoleMode($handle, $new)) { return $null }
+        return $mode
+    } catch {
+        return $null
+    }
+}
+
+function Restore-ConsoleMode($Mode) {
+    if ($null -eq $Mode) { return }
+    try {
+        [void][PunkDuck.ConsoleMode]::SetConsoleMode([PunkDuck.ConsoleMode]::GetStdHandle(-10), [uint32]$Mode)
+    } catch { }
 }
 
 # Run backup-manager.cmd with the console attached (needed for the interactive sign-in).
@@ -142,9 +175,18 @@ function Assert-Prerequisites {
     }
     $os = Get-CimInstance Win32_OperatingSystem
     $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-    if ([Environment]::OSVersion.Version.Major -ne 10 -or $os.ProductType -ne 1 -or $arch -ne 'AMD64') {
-        throw "Only Windows 10/11 x64 is supported (found: $($os.Caption), $arch)."
+    $v = [Environment]::OSVersion.Version
+    if (-not (Test-SupportedWindows $v.Major $v.Build ([int]$os.ProductType) $arch)) {
+        throw "Only Windows 10/11 and Windows Server 2016 or newer, 64-bit, are supported (found: $($os.Caption), $arch)."
     }
+}
+
+# Windows 10/11 or Windows Server 2016+ (incl. a domain controller), x64: what the bundled Node 22 supports.
+# ProductType: 1 workstation, 2 domain controller, 3 server. Server 2016 is build 14393.
+function Test-SupportedWindows([int]$Major, [int]$Build, [int]$ProductType, [string]$Arch) {
+    if ($Arch -ne 'AMD64' -or $Major -ne 10) { return $false }
+    if ($ProductType -eq 1) { return $true }
+    return ($ProductType -eq 2 -or $ProductType -eq 3) -and $Build -ge 14393
 }
 
 function Get-Package {
@@ -189,7 +231,10 @@ function Install-ProgramFiles([string]$Zip) {
     $old = "$InstallDir.old"
     foreach ($p in @($staging, $old)) { if (Test-Path $p) { Remove-Item -Recurse -Force $p } }
 
-    Expand-Archive -Path $Zip -DestinationPath $staging -Force
+    # Expand-Archive in Windows PowerShell 5.1 takes minutes for the ~9000 files in the package.
+    Write-Host 'Extracting ...'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $staging)
     if (-not (Test-Path (Join-Path $staging 'node.exe')) -or -not (Test-Path (Join-Path $staging "$AppName.cmd"))) {
         Remove-Item -Recurse -Force $staging
         throw 'The package is incomplete (node.exe or the launcher is missing).'
@@ -226,7 +271,8 @@ function Initialize-EnvFile {
     }
     Write-Host 'Leave BACKUP_ENCRYPTION_KEY empty: a key is generated in the next step.' -ForegroundColor Yellow
     if (-not $RestoreOnly) {
-        Write-Host 'Leave SQL_PASSWORD empty: the installer creates the SQL login and fills it in.' -ForegroundColor Yellow
+        Write-Host 'SQL_USER / SQL_PASSWORD: leave both empty and the installer creates a SQL login,' -ForegroundColor Yellow
+        Write-Host '  or enter an existing SQL login and its password to use that one.' -ForegroundColor Yellow
     }
     Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$EnvFile`"" -Wait
     # Windows 11 Notepad may return immediately (tabs in an already open window), so ask as well.
@@ -247,6 +293,10 @@ function Initialize-EncryptionKey {
     Write-Host ''
     Write-Host "   $key" -ForegroundColor White
     Write-Host ''
+    try {
+        Set-Clipboard -Value $key -ErrorAction Stop
+        Write-Host ' The key is also copied to the clipboard: paste it with Ctrl+V.' -ForegroundColor Yellow
+    } catch { }
     Write-Host ' Store it NOW in the company password manager under this client.' -ForegroundColor Yellow
     Write-Host ' Without it, the backups of this machine can never be restored.' -ForegroundColor Yellow
     Write-Host '=====================================================================' -ForegroundColor Yellow
@@ -402,6 +452,26 @@ function Test-SqlLoginName([string]$Name) {
     if (-not $Name -or $Name.Length -gt 128) { return $false }
     if ($Name -match '[\\\x00-\x1f]') { return $false }
     return $true
+}
+
+# Name of the login the installer creates when SQL_USER and SQL_PASSWORD are both empty.
+$DefaultSqlUser = 'backup_user'
+
+# What to do with the SQL login. $User is SQL_USER after the default was applied ('' never reaches here).
+#   use:      the technician gave SQL_USER and SQL_PASSWORD of an existing login -> keep it as it is
+#   create:   the login does not exist -> create it (with SQL_PASSWORD, or a generated one when empty)
+#   reset:    our own default login exists but the env file lost its password -> new generated password
+#   error:    Message says what to fix
+function Get-SqlLoginPlan([string]$User, [bool]$HasPassword, [bool]$LoginExists, [string]$DefaultUser = 'backup_user') {
+    if (-not $LoginExists) {
+        return @{ Action = 'create'; GeneratePassword = (-not $HasPassword) }
+    }
+    if ($HasPassword) { return @{ Action = 'use' } }
+    if ($User -eq $DefaultUser) { return @{ Action = 'reset' } }
+    return @{
+        Action  = 'error'
+        Message = "The SQL login '$User' already exists, but SQL_PASSWORD is empty. Enter its password in SQL_PASSWORD, or empty SQL_USER to let the installer create its own login ($DefaultUser)."
+    }
 }
 
 function Split-DatabaseList([string]$Value) {
@@ -584,6 +654,11 @@ function Initialize-SqlServer {
     }
     $inst = Resolve-SqlInstance (Get-EnvValue $EnvFile 'SQL_INSTANCE') (Get-EnvValue $EnvFile 'SQL_PORT')
     $login = Get-EnvValue $EnvFile 'SQL_USER'
+    $password = Get-EnvValue $EnvFile 'SQL_PASSWORD'
+    if (-not $login) {
+        if ($password) { throw "SQL_PASSWORD is set but SQL_USER is empty. Fill in both, or empty both to let the installer create a login. Fix it in $EnvFile." }
+        $login = $DefaultSqlUser
+    }
     if (-not (Test-SqlLoginName $login)) {
         throw "SQL_USER '$login' is not a valid SQL login name (no DOMAIN\user, at most 128 characters). Fix it in $EnvFile."
     }
@@ -640,27 +715,31 @@ function Initialize-SqlServer {
         $summary.Add("Backup folder: $backupDir (SQL_BACKUP_DIR)")
     }
 
-    # 4. The login
+    # 4. The login: use the one from the env file, or create one (see Get-SqlLoginPlan)
     $loginType = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginType -Params @{ login = $login } -Scalar
     if ($loginType -and $loginType -ne 'S') {
         throw "A Windows login or group named '$login' exists. SQL_USER must be a SQL login: choose another SQL_USER in $EnvFile."
     }
-    if (-not (Get-EnvValue $EnvFile 'SQL_PASSWORD')) {
+    $plan = Get-SqlLoginPlan $login ([bool]$password) ([bool]$loginType) $DefaultSqlUser
+    if ($plan.Action -eq 'error') { throw "$($plan.Message) ($EnvFile)" }
+    if ($plan.Action -eq 'use') {
+        $summary.Add("Login $login`: existing login from the env file used, its password and options not changed")
+    } else {
         # Change SQL Server first, then the env file: a failure never leaves a password SQL Server doesn't know.
-        $pw = New-SqlLoginPassword
+        $generated = $plan.Action -eq 'reset' -or $plan.GeneratePassword
+        $pw = if ($generated) { New-SqlLoginPassword } else { $password }
         try {
             $done = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlSetLoginPassword -Params @{ login = $login; pw = $pw } -Scalar
-            Set-EnvValue $EnvFile 'SQL_PASSWORD' $pw
+            Set-EnvValue $EnvFile 'SQL_USER' $login
+            if ($generated) { Set-EnvValue $EnvFile 'SQL_PASSWORD' $pw }
         } finally {
             Remove-Variable pw -ErrorAction SilentlyContinue
         }
-        $summary.Add("Login $login`: $done (password stored in the env file)")
-    } elseif (-not $loginType) {
-        throw "SQL_PASSWORD is set but the login '$login' does not exist. Empty SQL_PASSWORD in $EnvFile and run the installer again to let it create the login."
-    } else {
-        $summary.Add("Login $login`: kept (password from the env file not changed)")
+        $how = if ($generated) { 'random password stored in the env file' } else { 'password from the env file' }
+        $summary.Add("Login $login`: $done ($how)")
+        # Only for a login the installer manages: an expiry policy must never stop the nightly backups.
+        Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginOptions -Params @{ login = $login } | Out-Null
     }
-    Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginOptions -Params @{ login = $login } | Out-Null
 
     # 5. Users and grants
     $r = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlInDatabase -Scalar `
@@ -843,6 +922,7 @@ if ($ZipPath) {
 }
 
 Push-Location $env:SystemRoot   # never sit inside the folder we replace
+$savedConsoleMode = Disable-QuickEdit
 try {
     Install-BackupManager
 } catch {
@@ -852,5 +932,6 @@ try {
     # Only exit when run as a file; under "irm | iex" exit would close the technician's window.
     if ($PSCommandPath) { exit 1 }
 } finally {
+    Restore-ConsoleMode $savedConsoleMode
     Pop-Location
 }
