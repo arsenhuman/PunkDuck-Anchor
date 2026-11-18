@@ -189,6 +189,83 @@ Assert-Equal '(empty) = default instance, SQLEXPRESS' (Format-SqlInstanceNames @
 Assert-Equal 'none' (Format-SqlInstanceNames @()) 'no instances'
 Assert-Equal '(empty) = default instance' (Format-SqlInstanceNames @('')) 'only the default instance is not "none"'
 
+# ---- Test-ClientName ----
+foreach ($n in @('acme', 'ACME-2', 'client_01', 'a', ('x' * 32), '0', '-', '_a-')) {
+    Assert-True (Test-ClientName $n) "client name '$n' is valid"
+}
+foreach ($n in @('', ' ', 'acme corp', 'acme.', '..', 'a\b', 'a/b', '..\x', 'acme$', 'a(b)', "acme`n", "acme`r`n", ('caf' + [char]0xE9), ([string][char]0x212A + 'elvin'), ('x' * 33), 'a*', 'a[1]')) {
+    Assert-True (-not (Test-ClientName $n)) "client name '$n' is invalid"
+}
+
+# ---- Get-InstallLayout ----
+$l = Get-InstallLayout '' 'C:\ProgramData'
+Assert-Equal '' $l.Client 'no -Client: default install'
+Assert-Equal 'C:\ProgramData\backup-manager' $l.DataDir 'default data folder unchanged'
+Assert-Equal 'PunkDuck Backup Manager' $l.TaskName 'default task name unchanged'
+Assert-Equal 'backup_user' $l.DefaultSqlUser 'default SQL login unchanged'
+Assert-Equal 'backup' $l.TaskArguments 'default task arguments unchanged'
+Assert-Equal 0 @($l.HomeArgs).Count 'default install passes no --home'
+Assert-Equal 'C:\ProgramData\backup-manager' (Get-InstallLayout $null 'C:\ProgramData\').DataDir '$null client and a trailing backslash: same default folder'
+
+$l = Get-InstallLayout 'Acme-2' 'C:\ProgramData'
+Assert-Equal 'Acme-2' $l.Client 'client name kept as given'
+Assert-Equal 'C:\ProgramData\backup-manager-clients\Acme-2' $l.DataDir 'client data folder outside the default one'
+Assert-True (-not $l.DataDir.StartsWith('C:\ProgramData\backup-manager\')) 'client folder is not below the default data folder (uninstall -Purge)'
+Assert-Equal 'PunkDuck Backup Manager (Acme-2)' $l.TaskName 'client task name'
+Assert-Equal 'backup_acme-2' $l.DefaultSqlUser 'client SQL login is lower-case backup_<client>'
+Assert-True (Test-SqlLoginName $l.DefaultSqlUser) 'client SQL login is a valid login name'
+Assert-Equal 'Acme-2' (Get-ClientFromTaskName $l.TaskName) 'task name maps back to the client'
+Assert-Equal '--home|C:\ProgramData\backup-manager-clients\Acme-2' (@($l.HomeArgs) -join '|') 'Invoke-App passes --home <client folder>'
+Assert-Equal '--home "C:\ProgramData\backup-manager-clients\Acme-2" backup' $l.TaskArguments 'task runs backup with --home (quoted)'
+Assert-True (Test-SqlLoginName (Get-InstallLayout ('x' * 32) 'C:\ProgramData').DefaultSqlUser) 'longest client name gives a valid login'
+foreach ($bad in @('acme corp', '..', 'a\b', ' ')) {
+    $threw = $false
+    try { Get-InstallLayout $bad 'C:\ProgramData' | Out-Null } catch { $threw = $true }
+    Assert-True $threw "Get-InstallLayout refuses client '$bad'"
+}
+
+# ---- Get-ClientFromTaskName ----
+Assert-Equal '' (Get-ClientFromTaskName 'PunkDuck Backup Manager') 'default task'
+Assert-Equal 'acme' (Get-ClientFromTaskName 'PunkDuck Backup Manager (acme)') 'client task'
+foreach ($t in @('Other task', 'PunkDuck Backup Manager (a b)', 'PunkDuck Backup Manager ()', 'PunkDuck Backup Manager (acme) old', 'PunkDuck Backup Manager acme', "PunkDuck Backup Manager (acme)`n")) {
+    Assert-True ($null -eq (Get-ClientFromTaskName $t)) "'$t' is not one of our tasks"
+}
+
+# ---- Get-TaskStartTime ----
+Assert-Equal '02:00' (Get-TaskStartTime '2026-11-18T02:00:00') 'trigger start time'
+Assert-Equal '23:30' (Get-TaskStartTime '2026-11-18T23:30:00+01:00') 'trigger start time with an offset'
+Assert-Equal '' (Get-TaskStartTime '') 'no start boundary'
+
+# ---- Merge-ClientNames ----
+$m = @(Merge-ClientNames @('beta', 'Acme', 'not a client', 'x.y') @('acme', 'gamma', ''))
+Assert-Equal 'Acme beta gamma' ($m -join ' ') 'folders and tasks merged, invalid names dropped, case-insensitive unique, sorted'
+Assert-Equal 0 @(Merge-ClientNames @() @()).Count 'no clients'
+
+# ---- uninstall.ps1 has the same client rules (it runs without install.ps1) ----
+$uninstallPs1 = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'packaging') 'uninstall.ps1'
+$uTokens = $null
+$uErrors = $null
+$uAst = [System.Management.Automation.Language.Parser]::ParseFile($uninstallPs1, [ref]$uTokens, [ref]$uErrors)
+if ($uErrors.Count) { throw "uninstall.ps1 does not parse: $($uErrors[0].Message)" }
+$names = @('acme', 'Acme-2', '', ' ', 'a b', '..', 'a\b', ('x' * 32), ('x' * 33), "acme`n")
+$tasks = @('PunkDuck Backup Manager', 'PunkDuck Backup Manager (acme)', 'PunkDuck Backup Manager (a b)', 'Other', "PunkDuck Backup Manager (acme)`n")
+$expectedNames = @($names | ForEach-Object { Test-ClientName $_ })
+$expectedTasks = @($tasks | ForEach-Object { "$(Get-ClientFromTaskName $_)|$($null -eq (Get-ClientFromTaskName $_))" })
+& {
+    foreach ($fn in @('Test-ClientName', 'Get-ClientFromTaskName')) {
+        $def = $uAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+        Assert-True ($null -ne $def) "uninstall.ps1 defines $fn"
+        if ($def) { . ([scriptblock]::Create($def.Extent.Text)) }   # local to this block
+    }
+    for ($k = 0; $k -lt $names.Count; $k++) {
+        Assert-Equal $expectedNames[$k] (Test-ClientName $names[$k]) "uninstall.ps1 Test-ClientName agrees on '$($names[$k])'"
+    }
+    for ($k = 0; $k -lt $tasks.Count; $k++) {
+        $got = "$(Get-ClientFromTaskName $tasks[$k])|$($null -eq (Get-ClientFromTaskName $tasks[$k]))"
+        Assert-Equal $expectedTasks[$k] $got "uninstall.ps1 Get-ClientFromTaskName agrees on '$($tasks[$k])'"
+    }
+}
+
 # ---- Security invariant: T-SQL is constant text, values only as parameters ----
 # Every -Sql argument of Invoke-SqlAdmin is a $Sql* variable, and every $Sql* variable is assigned
 # exactly once, at the top level, from a single-quoted string (no interpolation, no concatenation).

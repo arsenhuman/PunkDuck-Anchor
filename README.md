@@ -5,11 +5,13 @@
 A Windows program that takes **native SQL Server backups** (`BACKUP DATABASE ... TO DISK`) every night and uploads
 them, compressed and encrypted, to the **client's own Google Drive**.
 
-- **Target:** Windows 10/11 or Windows Server 2016 or newer, x64; SQL Server 2016 or newer (Express included). One SQL Server per machine.
+- **Target:** Windows 10/11 or Windows Server 2016 or newer, x64; SQL Server 2016 or newer (Express included). One SQL Server per machine; several clients can share it, each
+  with its own settings, key, Google Drive and task (see [Several clients on one machine](#several-clients-on-one-machine)).
 - **Delivery:** a self-contained release zip (bundled `node.exe`, nothing to install beforehand), installed by
   **our team over RDP** with `install.ps1`. The installer also prepares SQL Server (login, permissions, mixed mode,
   TCP/IP); the only decision it asks for is whether SQL Server may be restarted now.
-- **Scheduling:** Windows Task Scheduler, task **"PunkDuck Backup Manager"**, daily, as SYSTEM.
+- **Scheduling:** Windows Task Scheduler, task **"PunkDuck Backup Manager"** (a client installed with `-Client X`:
+  **"PunkDuck Backup Manager (X)"**), daily, as SYSTEM.
 - **Monitoring:** Healthchecks.io, one check per client.
 - **Restores:** always done by our team. See [RESTORE.md](RESTORE.md).
 
@@ -39,9 +41,13 @@ If one database fails, the others still run. The exit code is `1` if any databas
 | Google sign-in | `C:\ProgramData\backup-manager\token.json` |
 | Logs | `C:\ProgramData\backup-manager\logs\backup-YYYY-MM-DD.log` (kept 30 days) |
 | Scratch | `C:\ProgramData\backup-manager\work\` |
+| Client `X` (`install.ps1 -Client X`) | `C:\ProgramData\backup-manager-clients\X\` with the same files: `backup-manager.env`, `token.json`, `logs\`, `work\` |
+| Scheduled task | `PunkDuck Backup Manager`; client `X`: `PunkDuck Backup Manager (X)` |
 
-Both folders are restricted to **SYSTEM and Administrators** by the installer (`icacls`). The data folder can be
-moved with the `BACKUP_MANAGER_HOME` environment variable (used by the tests).
+All these folders are restricted to **SYSTEM and Administrators** by the installer (`icacls`). The program folder is
+shared by the default install and every client. The program finds its data folder in this order: `--home <dir>`
+on the command line (what a client's scheduled task passes), the `BACKUP_MANAGER_HOME` environment variable (used
+by the tests), then `C:\ProgramData\backup-manager`.
 
 ## One-time setup (our company)
 
@@ -138,6 +144,8 @@ Installer options (they need the `-File` form, not `irm | iex`):
 | `-ZipPath .\backup-manager-1.2.0-win-x64.zip` | Offline install when GitHub is blocked: copy the zip **and** its `.sha256` into the same folder first |
 | `-RestoreOnly` | Restore machine for another client's backups: no SQL Server preparation or SQL checks, no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
 | `-SkipSqlSetup` | Don't touch SQL Server (the client's DBA manages it): the DBA runs `sql-prepare.sql` instead, see *SQL Server preparation* |
+| `-Client acme` | Install or update the client `acme` on a machine that backs up several clients: own data folder, key, Google account, task and SQL login. Letters, digits, `-`, `_`, at most 32. See *Several clients on one machine* |
+| `-ListClients` | Only list what is installed here (default install and every client: data folder, task, next run, Google account) and exit |
 
 The installer:
 
@@ -157,15 +165,18 @@ The installer:
    Fix the env file and run the installer again; re-running is safe.
 9. Runs `backup-manager auth login` if there is no working Google sign-in (see *Google sign-in*), then the full
    `check` again. It stops if the signed-in account is not `GOOGLE_EMAIL`.
-10. Registers or updates the scheduled task "PunkDuck Backup Manager": daily at `BACKUP_TIME`, as SYSTEM with highest
-    privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs.
-11. Runs the first backup and prints the result.
+10. Registers or updates the scheduled task "PunkDuck Backup Manager" (with `-Client X`: "PunkDuck Backup Manager (X)",
+    which runs `backup-manager.cmd --home <client folder> backup`): daily at `BACKUP_TIME`, as SYSTEM with highest
+    privileges, run as soon as possible after a missed start, 12-hour limit, no overlapping runs. It warns when
+    another install's task starts at the same minute.
+11. Runs the first backup and prints the result, then a summary (client, data folder, task, Google account) and
+    everything installed on the machine.
 
 Whenever it stops, fix what it says and run it again: it keeps what you already entered and redoes only what is
 still missing.
 
 **Update:** run the installer again. It keeps the env file, the key and the Google sign-in. It refuses to update
-while a backup is running.
+while a backup is running (any install's: the program files are shared).
 
 **Uninstall:**
 
@@ -174,9 +185,40 @@ while a backup is running.
 powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1"
 # also revokes the Google sign-in and deletes C:\ProgramData\backup-manager
 powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1" -Purge
+
+# one client only: removes its task; -Purge also revokes its sign-in and deletes its data folder
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1" -Client acme -Purge
 ```
 
-**Backups on Google Drive are never touched** by the uninstaller.
+The plain uninstall (without `-Client`) refuses and changes nothing while a client still has a scheduled task:
+uninstall each client first. **Backups on Google Drive are never touched** and **SQL logins are never dropped** by the
+uninstaller.
+
+### Several clients on one machine
+
+One machine and one SQL Server can back up several clients, each to **its own** Google Drive. Install the first
+client normally (or with `-Client`), every further one with `-Client <name>`:
+
+| | Default install | `-Client acme` |
+| --- | --- | --- |
+| Data folder | `C:\ProgramData\backup-manager\` | `C:\ProgramData\backup-manager-clients\acme\` |
+| Settings, key, Google sign-in, logs | in the data folder | in the data folder |
+| Scheduled task | `PunkDuck Backup Manager` | `PunkDuck Backup Manager (acme)` |
+| SQL login created by step 7 (`SQL_USER` empty) | `backup_user` | `backup_acme` (lower case) |
+| Commands | `& $bm check` | `& $bm --home C:\ProgramData\backup-manager-clients\acme check` |
+
+- The **program files are shared**: installing or updating any client updates them for all, and the installer refuses
+  while any backup is running.
+- Each client has its own env file, so `SQL_DATABASES`, `GOOGLE_EMAIL`, `HEALTHCHECK_URL`, `SERVER_NAME` and
+  `BACKUP_TIME` are per client. Each client's SQL login gets `db_backupoperator` only in that client's databases.
+  Server-wide settings (mixed mode, TCP/IP, port) are changed at most once; later clients find them done.
+- Give each client its own `BACKUP_TIME` (e.g. 30 minutes apart) so their backups don't compete for the disk.
+- `install.ps1 -ListClients` shows everything installed on the machine.
+- Moving an existing default install to a client is not automated. By hand, before any client is installed:
+  run `uninstall.ps1` **without** `-Purge` (removes the task and the program files, keeps the data), create
+  `C:\ProgramData\backup-manager-clients\<name>\`, copy `backup-manager.env` and `token.json` from
+  `C:\ProgramData\backup-manager\` into it, then run `install.ps1 -Client <name>`. It keeps the settings, key, SQL
+  login and Google sign-in, and locks the folder. Delete the old data folder once the first client backup succeeded.
 
 ### SQL Server preparation
 
@@ -193,9 +235,9 @@ What it does, all safe to repeat:
    starts it if it is stopped. It skips the whole step if `SQL_HOST` is not this machine.
 2. Checks that every database in `SQL_DATABASES` exists, is `ONLINE` and is writable, before it changes anything.
 3. **The login.**
-   - `SQL_USER` and `SQL_PASSWORD` **both empty** (the default): it creates the login `backup_user` with a random
-     32-character password and writes both into the env file. The password is never shown. If `backup_user` already
-     exists (e.g. the env file was deleted), its password is reset.
+   - `SQL_USER` and `SQL_PASSWORD` **both empty** (the default): it creates the login `backup_user` (with
+     `-Client acme`: `backup_acme`) with a random 32-character password and writes both into the env file. The
+     password is never shown. If that login already exists (e.g. the env file was deleted), its password is reset.
    - **Both set:** that login is used. An existing login is **not changed** (password, options); a login that doesn't
      exist yet is created with that password.
    - `SQL_USER` set, `SQL_PASSWORD` empty: a new login is created with a random password. If that login already
@@ -366,6 +408,8 @@ alerts us. Fix: run `auth login` again.
 
 Run in an Administrator PowerShell, after `$bm = "C:\Program Files\backup-manager\backup-manager.cmd"`.
 `--server` picks the Drive folder of another machine (`SERVER_NAME`); it is only needed on a restore machine.
+For a client installed with `-Client acme`, add `--home C:\ProgramData\backup-manager-clients\acme` to every command;
+without it, a command works on the default install.
 
 ```powershell
 & $bm check                                # verify settings, SQL Server, folder, Google; exit 0 only if all pass
@@ -384,7 +428,8 @@ writes them to stderr. Passwords, tokens and keys are redacted. Log files older 
 of each run.
 
 To see why a scheduled run failed: Task Scheduler > "PunkDuck Backup Manager" > Last Run Result, then the log file
-of that day.
+of that day. A client's task is "PunkDuck Backup Manager (X)" and its logs are in
+`C:\ProgramData\backup-manager-clients\X\logs\`.
 
 ## Internals (for developers and AI agents)
 
@@ -413,15 +458,15 @@ reading every file first. Everything above it describes how to *use* the tool.
 
 | File | Responsibility | Key exports |
 | --- | --- | --- |
-| `packaging/install.ps1`, `uninstall.ps1` | Windows install/update/uninstall (PowerShell 5.1, pure ASCII). `install.ps1` also prepares SQL Server (`Initialize-SqlServer`: `System.Data.SqlClient` over shared memory + the SQL Server WMI provider) | — |
+| `packaging/install.ps1`, `uninstall.ps1` | Windows install/update/uninstall (PowerShell 5.1, pure ASCII). `install.ps1` also prepares SQL Server (`Initialize-SqlServer`: `System.Data.SqlClient` over shared memory + the SQL Server WMI provider). `-Client` picks the install through `Get-InstallLayout` | — |
 | `packaging/backup-manager.cmd` | Launcher: runs `bin/backup-manager.js` with the bundled `node.exe` | — |
 | `packaging/backup-manager.env.template` | Commented env file template copied by the installer | — |
 | `packaging/sql-prepare.sql` | Manual SQL Server preparation for technicians who are not sysadmin (shipped in the zip) | — |
 | `scripts/build-package.js` | Builds the release zip (downloads + verifies Node, `npm ci --omit=dev`, writes `oauth-client.json`) | `build`, `verifyShasum`, `oauthClientJson` |
 | `bin/backup-manager.js` | Shebang wrapper: runs `main`, sets `process.exitCode`, prints `Error: …` for uncaught errors | — |
-| `src/cli.js` | Argument parsing (`node:util` `parseArgs`), command dispatch, human/JSON output | `main`, `USAGE` |
+| `src/cli.js` | Argument parsing (`node:util` `parseArgs`), command dispatch, human/JSON output; `--home` overrides `BACKUP_MANAGER_HOME` | `main`, `USAGE` |
 | `src/envconfig.js` | Parses `backup-manager.env` (`util.parseEnv`), validates with env-key error messages, maps onto `normalizeConfig`; reads `oauth-client.json` | `loadEnvConfig`, `envToConfig`, `parseEnvText`, `isLocalSqlHost`, `ENV_KEYS` |
-| `src/paths.js` | Program folder (`APP_ROOT`) and data folder (`BACKUP_MANAGER_HOME`, default `C:\ProgramData\backup-manager`) | `appHome`, `appPaths`, `APP_ROOT` |
+| `src/paths.js` | Program folder (`APP_ROOT`) and data folder (`BACKUP_MANAGER_HOME`, set by `--home`; default `C:\ProgramData\backup-manager`) | `appHome`, `appPaths`, `APP_ROOT` |
 | `src/check.js` | The `check` command: all checks with injected I/O (`skipAuth`, `skipSql`), SQL error explanations with the exact fix SQL | `runChecks`, `explainSqlError`, `formatChecks`, `verifyGrantFix` |
 | `src/config.js` | Validates and applies defaults (`normalizeConfig`); internal JSON loader (`-c`, development only) | `loadConfig`, `normalizeConfig`, `ConfigError`, `parseEncryptionKey` |
 | `src/auth.js` | OAuth installed-app flow (loopback + PKCE + state, plus paste fallback), token file I/O, status, logout/revoke | `login`, `status`, `logout`, `getAuthorizedClient`, `startLoopbackServer`, `parsePastedRedirect` |
@@ -491,7 +536,29 @@ My Drive/
 | `<data>/logs/backup-YYYY-MM-DD.log` | `createLogger` | 30 days (`cleanupLogs` at the start of each run) |
 | `<outDir>/<base>.bak.download` and `.partial` | `downloadBackup` | Temporary. Renamed to `<base>.bak` on success, removed on failure |
 
+`<data>` is the data folder of the install: `C:\ProgramData\backup-manager`, or
+`C:\ProgramData\backup-manager-clients\<client>` for `install.ps1 -Client`. `workDir` is `<data>\work`.
+
 Token file contents: `{ "refresh_token", "scope", "email", "createdAt" }`. No access token is stored.
+
+### Several clients (`install.ps1 -Client`)
+
+- **Nothing in `src/` knows about clients.** The installer gives each client its own data folder and passes it as
+  `--home <dir>` (`src/cli.js` sets `BACKUP_MANAGER_HOME` from it for that run only): in the scheduled task's
+  arguments and in every `Invoke-App` call of the install. There is no machine-wide environment variable, so two
+  clients can never read each other's env file or token.
+- **`Get-InstallLayout`** (pure, tested) maps `-Client` to the data folder, task name, default SQL login, `--home`
+  arguments and task arguments. `''` gives exactly the paths and names of an install without `-Client`.
+  `Use-InstallLayout` copies them into the script variables (`$DataDir`, `$EnvFile`, `$TaskName`, ...) the rest of
+  `install.ps1` uses.
+- **Client data lives in `C:\ProgramData\backup-manager-clients\`**, not below `C:\ProgramData\backup-manager`, so
+  `uninstall.ps1 -Purge` of the default install can never delete it.
+- **Task names identify installs:** `Get-ClientFromTaskName` maps `PunkDuck Backup Manager` to `''`, `PunkDuck
+  Backup Manager (X)` to `X`, anything else to `$null`. `Install-ProgramFiles` refuses while any of them runs;
+  `uninstall.ps1` without `-Client` refuses while any client task exists. `uninstall.ps1` carries its own copies of
+  `Test-ClientName` and `Get-ClientFromTaskName`; `test/install-functions.ps1` checks they agree with `install.ps1`.
+- **Client names** (`Test-ClientName`): `^[A-Za-z0-9_-]{1,32}\z`, case-sensitive match so no Unicode case folding
+  lets other characters in. Safe as a folder name, inside a task name and in the SQL login `backup_<name>`.
 
 ### Encrypted file format
 
@@ -568,9 +635,9 @@ AAD        = the 13-byte header
 | `test/auth.test.js` | Token file permissions, the loopback server (good state, CSRF state, denial, timeout), the paste fallback and logout |
 | `test/envconfig.test.js` | Env file parsing and mapping, env-key error messages, paths and `BACKUP_MANAGER_HOME` |
 | `test/check.test.js` | Every `check` outcome with fake SQL/Google (including verify permission and `--skip-sql`), SQL error explanations (262 behind 3013) |
-| `test/install-functions.ps1` | Pure functions of `install.ps1` (password generator, instance resolution, local host, port plan, WMI namespace) and invariant 10. Windows PowerShell 5.1 in the Windows CI job; it loads only the function definitions via the AST |
+| `test/install-functions.ps1` | Pure functions of `install.ps1` (password generator, instance resolution, local host, port plan, WMI namespace, client name, install layout, task names) and invariant 10; the client helpers of `uninstall.ps1` agree with `install.ps1`. Windows PowerShell 5.1 in the Windows CI job; it loads only the function definitions via the AST |
 | `test/build-package.test.js` | Release build helpers (SHASUMS verification, `oauth-client.json`, Node version), packaging files present and pure ASCII |
-| `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `cli` | Unit tests for the pure parts, log files, CLI with `BACKUP_MANAGER_HOME` |
+| `test/config.test.js`, `naming`, `retention`, `mssql`, `logger`, `cli` | Unit tests for the pure parts, log files, CLI with `BACKUP_MANAGER_HOME` and `--home` |
 
 Testing patterns to reuse:
 - `DriveStore` takes any `request(opts) → {status, data, headers}` function. In production that is `OAuth2Client#request`. In tests, use `createFakeDriveApi().request`.

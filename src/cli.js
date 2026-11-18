@@ -32,14 +32,18 @@ Commands:
   keygen                               Print a new random encryption key (base64)
 
 Settings are read from backup-manager.env in the data folder
-(C:\\ProgramData\\backup-manager, or BACKUP_MANAGER_HOME).
+(C:\\ProgramData\\backup-manager, or BACKUP_MANAGER_HOME, or --home).
 
 Options:
+  --home <dir>        Data folder to use (env file, Google sign-in, logs); overrides
+                      BACKUP_MANAGER_HOME. A client installed with install.ps1 -Client X
+                      uses C:\\ProgramData\\backup-manager-clients\\X
   -h, --help          Show this help
 `;
 
 const OPTIONS = {
   config: { type: 'string', short: 'c' }, // internal: JSON config instead of the env file
+  home: { type: 'string' }, // data folder; overrides BACKUP_MANAGER_HOME (install.ps1 -Client tasks)
   server: { type: 'string' },
   db: { type: 'string' },
   out: { type: 'string', default: '.' },
@@ -86,6 +90,8 @@ async function makeDrive(config, logger) {
 /**
  * Returns the process exit code.
  * Injectable for tests: stdout, stdin, logger, env (for BACKUP_MANAGER_HOME), createSqlClient, authStatus.
+ * --home <dir> overrides BACKUP_MANAGER_HOME: the scheduled task of a client installed with
+ * install.ps1 -Client passes it, so no machine-wide environment variable is needed.
  */
 export async function main(argv, {
   stdout = process.stdout,
@@ -104,6 +110,13 @@ export async function main(argv, {
     return 2;
   }
   const { values: opts, positionals } = parsed;
+  if (opts.home !== undefined) {
+    if (!opts.home.trim()) {
+      stdout.write(`--home needs a folder\n\n${USAGE}`);
+      return 2;
+    }
+    env = { ...env, BACKUP_MANAGER_HOME: opts.home };
+  }
   const [cmd, sub] = positionals;
   if (opts.help || !cmd) {
     stdout.write(USAGE);

@@ -81,7 +81,8 @@ Fill in these lines, nothing else:
 | `HEALTHCHECK_URL=` | the ping URL from section 1 | `HEALTHCHECK_URL=https://hc-ping.com/...` |
 
 **`SQL_USER` and `SQL_PASSWORD`:**
-- **Normally leave both empty.** The installer creates a SQL login called `backup_user` with a random password.
+- **Normally leave both empty.** The installer creates a SQL login called `backup_user` with a random password
+  (for a second client on the same server, see section 8: `backup_<client>`).
 - Only if the client gives you a SQL login to use, enter its name and password there.
 
 Leave everything else as it is. Then **save (Ctrl+S)**, **close Notepad**, go back to PowerShell and press **Enter**.
@@ -177,7 +178,7 @@ The installer prints **INSTALL STOPPED:** in red with the reason. Fix it and run
 | `Could not sign in as sa` | Wrong password, `sa` disabled, or SQL Server accepts only Windows sign-in. See section 7 |
 | `... is not a sysadmin` | See section 7 |
 | `The Google check failed` / wrong account | You signed in with the wrong Google account. Run the two `auth` commands below, then the installer again |
-| `A backup is running right now` | Wait until it finishes, then run the installer again |
+| `A backup is running right now` | Wait until it finishes, then run the installer again. With several clients (section 8), any client's backup blocks it |
 | The window looks frozen | Window title starts with "Select"? Press **Esc** |
 | `Could not create SSL/TLS secure channel` | You ran only the second line of the command. Run both lines |
 | `Only Windows 10/11 and Windows Server 2016 or newer` | This Windows is too old (e.g. Server 2012 R2). It can't be installed here; tell the team |
@@ -236,11 +237,77 @@ are kept.
 powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1"
 ```
 
-Backups already on Google Drive are never deleted.
+Backups already on Google Drive are never deleted. With several clients on the server, see section 8.
 
 ---
 
-## 8. Useful commands
+## 8. Several clients on one server
+
+One server with one SQL Server can back up **several clients**, each into **its own Google Drive**, with its own
+settings, encryption key, SQL login and nightly task.
+
+**Install the clients:**
+
+1. The first client: install it as in section 4 (the normal install), **or** already with a name as below.
+2. Every further client: install it with **`-Client <name>`**. The name: letters, digits, `-` and `_`, no spaces,
+   at most 32 characters (e.g. `acme`, `bakery-2`).
+
+   ```powershell
+   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+   irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 -OutFile install.ps1
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Client acme
+   ```
+
+   The 11 steps are the same as in section 4. The settings file that opens in Notepad is **only this client's**:
+   enter **only this client's databases** and **this client's Gmail**.
+
+**For every client, separately:**
+
+- [ ] **Its own encryption key** in the password manager, saved under **that client's name**. Each client has a
+      different key; the installer shows it once per client.
+- [ ] **Its own Healthchecks.io check** (section 1) and its ping URL in that client's `HEALTHCHECK_URL`.
+- [ ] **A different `BACKUP_TIME`**, so two clients never back up at the same minute, e.g. `02:00`, `02:30`,
+      `03:00`. The installer prints a **Note** if another client already starts at the same time.
+
+**Where things are** for client `acme`:
+
+| What | Where |
+|------|-------|
+| Settings file | `C:\ProgramData\backup-manager-clients\acme\backup-manager.env` |
+| Logs | `C:\ProgramData\backup-manager-clients\acme\logs\` |
+| Nightly task (Task Scheduler) | **"PunkDuck Backup Manager (acme)"** |
+| SQL login | `backup_acme` |
+
+**Commands for a client:** add `--home` with the client's folder, otherwise the command works on the normal install:
+
+```powershell
+$bm = "C:\Program Files\backup-manager\backup-manager.cmd"
+& $bm --home C:\ProgramData\backup-manager-clients\acme check
+& $bm --home C:\ProgramData\backup-manager-clients\acme auth status
+```
+
+**What is installed on this server?**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -ListClients
+```
+
+**Update:** run the installer once, with or without `-Client`: the program is shared, so all clients are updated.
+It refuses while any client's backup is running.
+
+**Uninstall one client** (the others keep working):
+
+```powershell
+# removes the client's nightly task; -Purge also deletes its settings, key and Google sign-in on this server
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1" -Client acme -Purge
+```
+
+The normal uninstall (without `-Client`) refuses while clients are still installed and lists them: uninstall each
+client first. SQL logins are never deleted; remove `backup_acme` in SSMS if it is no longer needed.
+
+---
+
+## 9. Useful commands
 
 ```powershell
 $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
@@ -251,6 +318,7 @@ $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
 ```
 
 To see why a night's backup failed: open **Task Scheduler**, then **"PunkDuck Backup Manager"**, then **Last Run
-Result**, and the log of that day in `C:\ProgramData\backup-manager\logs\`.
+Result**, and the log of that day in `C:\ProgramData\backup-manager\logs\`. For a client installed with `-Client`,
+see section 8.
 
 For technical details see [README.md](README.md).
