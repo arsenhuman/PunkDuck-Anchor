@@ -343,6 +343,89 @@ foreach ($name in $sqlVars.Keys) {
     Assert-True ($mine[0].Parent.Parent -eq $ast) "`$$name must be defined at the top level of install.ps1"
 }
 
+# ---- Install log: secrets never reach it ----
+foreach ($k in @('SQL_PASSWORD', 'BACKUP_ENCRYPTION_KEY', 'HEALTHCHECK_URL', 'GOOGLE_CLIENT_SECRET', 'KEY')) {
+    Assert-True (Test-SecretSetting $k) "$k is a secret setting"
+    Assert-Equal '[hidden]' (Format-LogSetting $k 'value') "$k is hidden in the log"
+}
+foreach ($k in @('SQL_USER', 'SQL_DATABASES', 'SQL_BACKUP_DIR', 'KEEP_LAST', 'GOOGLE_EMAIL', 'SERVER_NAME')) {
+    Assert-True (-not (Test-SecretSetting $k)) "$k is not a secret setting"
+    Assert-Equal 'v' (Format-LogSetting $k 'v') "$k is shown in the log"
+}
+Assert-Equal '' (Format-LogSetting 'SQL_PASSWORD' '') 'an empty secret shows as empty (the log still says it is not set)'
+$logged = Format-SqlParamsForLog @{ login = 'backup_user'; pw = 'S3cret!'; inner = ('x' * 500); isMaster = 1 }
+Assert-True (-not $logged.Contains('S3cret!')) 'the SQL password parameter is never logged'
+Assert-True ($logged.Contains('pw=[hidden]')) 'the SQL password parameter shows as [hidden]'
+Assert-True ($logged.Contains('login=backup_user')) 'other SQL parameters are logged'
+Assert-True ($logged.Contains('inner=<T-SQL script, 500 characters')) 'long SQL parameters are shortened'
+
+# The encryption key line is printed with the log muted, and Set-EnvValue logs secrets as [hidden].
+$tmpEnv = [IO.Path]::GetTempFileName()
+try {
+    $script:LogFile = $null
+    $script:LogBuffer = New-Object 'System.Collections.Generic.List[string]'
+    [IO.File]::WriteAllLines($tmpEnv, @('SQL_USER=', 'SQL_PASSWORD='))
+    Set-EnvValue $tmpEnv 'SQL_PASSWORD' 'TopSecret1'
+    Set-EnvValue $tmpEnv 'SQL_USER' 'backup_user'
+    $all = $script:LogBuffer -join "`n"
+    Assert-True (-not $all.Contains('TopSecret1')) 'Set-EnvValue never logs a secret value'
+    Assert-True ($all.Contains('SQL_PASSWORD=[hidden]')) 'Set-EnvValue logs that the secret changed'
+    Assert-True ($all.Contains('SQL_USER=backup_user')) 'Set-EnvValue logs ordinary values'
+    Assert-Equal 'TopSecret1' (Get-EnvValue $tmpEnv 'SQL_PASSWORD') 'the file still gets the real value'
+    Write-SettingsToLog $tmpEnv 'Settings:'
+    Assert-True (-not ($script:LogBuffer -join "`n").Contains('TopSecret1')) 'Write-SettingsToLog never logs a secret value'
+} finally {
+    Remove-Item -Force $tmpEnv
+}
+
+# The Write-Host proxy: logs what is printed, nothing while muted, and takes the real Write-Host parameters.
+$script:LogFile = $null
+$script:LogBuffer = New-Object 'System.Collections.Generic.List[string]'
+$script:LogMuted = $true
+try { Write-Host 'SECRETKEY' -ForegroundColor White } finally { $script:LogMuted = $false }
+Assert-True (-not ($script:LogBuffer -join "`n").Contains('SECRETKEY')) 'nothing is logged while the log is muted'
+$threw = $false
+try {
+    Write-Host 'plain line'
+    Write-Host 'a' 'b' -Separator '-' -NoNewline -BackgroundColor DarkBlue -ForegroundColor White
+    Microsoft.PowerShell.Utility\Write-Host ''
+    'piped line' | Write-Host
+} catch { $threw = $true }
+Assert-True (-not $threw) 'the Write-Host proxy accepts every parameter of the real Write-Host and pipeline input'
+$all = $script:LogBuffer -join "`n"
+Assert-True ($all.Contains('  plain line')) 'Write-Host output is logged'
+Assert-True ($all.Contains('  a-b')) 'the separator is used in the log'
+Assert-True ($all.Contains('  piped line')) 'piped Write-Host input is logged'
+Assert-True ($script:LogBuffer[0] -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  ') 'log lines start with an invariant timestamp'
+Write-Log "first`nsecond"
+Assert-True ($script:LogBuffer[-1] -match "first\r\n {21}second$") 'multi-line messages are indented under the timestamp'
+
+# Start-InstallLog writes the lines kept in memory, then appends to the file.
+$tmpLogDir = Join-Path ([IO.Path]::GetTempPath()) ('bm-log-test-' + [guid]::NewGuid())
+try {
+    $script:LogFile = $null
+    $script:LogBuffer = New-Object 'System.Collections.Generic.List[string]'
+    Write-Log 'before the folder existed'
+    Start-InstallLog $tmpLogDir
+    Write-Log 'after'
+    Assert-True ([bool]$script:LogFile) 'Start-InstallLog sets the log file'
+    Assert-True ((Split-Path -Leaf $script:LogFile) -match '^install-\d{8}-\d{6}\.log$') 'install log file name'
+    $text = [IO.File]::ReadAllText($script:LogFile)
+    Assert-True ($text.Contains('before the folder existed') -and $text.Contains('after')) 'buffered and new lines are in the file'
+    Assert-Equal 0 $script:LogBuffer.Count 'the buffer is empty once written'
+} finally {
+    $script:LogFile = $null
+    Remove-Item -Recurse -Force $tmpLogDir -ErrorAction SilentlyContinue
+}
+
+# Grants results: "change" only when something changed.
+Assert-Equal 'SQL Server change:' (Get-GrantLogLabel '[u] created (CREATE USER [u] FOR LOGIN [u]); ALTER ROLE db_backupoperator ADD MEMBER [u]') 'created user is a change'
+Assert-Equal 'SQL Server change:' (Get-GrantLogLabel '[u] remapped to the login; already in db_backupoperator') 'remapped user is a change'
+Assert-Equal 'SQL Server change:' (Get-GrantLogLabel '[u] kept; ALTER ROLE db_backupoperator ADD MEMBER [u]') 'role membership added is a change'
+Assert-Equal 'SQL Server change:' (Get-GrantLogLabel '[u] kept; GRANT CREATE DATABASE TO [u]') 'GRANT is a change (it runs every time)'
+Assert-Equal 'SQL Server, no change:' (Get-GrantLogLabel '[u] kept; already in db_backupoperator') 'nothing done is not a change'
+Assert-Equal 'SQL Server, no change:' (Get-GrantLogLabel '[dbo] kept; it is the database owner (dbo), nothing to grant') 'dbo is not a change'
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) of $($script:Count) assertions failed." -ForegroundColor Red

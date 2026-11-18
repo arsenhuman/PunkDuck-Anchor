@@ -40,6 +40,7 @@ If one database fails, the others still run. The exit code is `1` if any databas
 | Settings (env file) | `C:\ProgramData\backup-manager\backup-manager.env` |
 | Google sign-in | `C:\ProgramData\backup-manager\token.json` |
 | Logs | `C:\ProgramData\backup-manager\logs\backup-YYYY-MM-DD.log` (kept 30 days) |
+| Install log | `C:\ProgramData\backup-manager\logs\install-YYYYMMDD-HHmmss.log`, one per installer run, never deleted automatically (see *Install log*) |
 | Scratch | `C:\ProgramData\backup-manager\work\` |
 | Client `X` (`install.ps1 -Client X`) | `C:\ProgramData\backup-manager-clients\X\` with the same files: `backup-manager.env`, `token.json`, `logs\`, `work\` |
 | Scheduled task | `PunkDuck Backup Manager`; client `X`: `PunkDuck Backup Manager (X)` |
@@ -288,6 +289,16 @@ Type RESTART to apply now, or press Enter to stop and run the installer again la
 
 It ends with a summary (login created/kept, databases, settings changed, restart or not). A second run finds
 nothing to change and does not ask again.
+
+**Install log.** Every run of `install.ps1` writes `logs\install-YYYYMMDD-HHmmss.log` in the data folder (readable
+by SYSTEM and Administrators only), so the work can be checked afterwards. It has everything the installer printed,
+the settings file as saved (secrets hidden) and every change to it, folder permissions, program files, services,
+the scheduled task, the output of the `check` and `backup` runs, and for SQL Server: every statement with its
+parameters, the account it ran as and its result, plus one `SQL Server change:` line per change (`SQL Server, no change:` when a re-run finds it in place) (login created or
+password reset, user created or re-linked, `GRANT CREATE DATABASE`, `ALTER ROLE db_backupoperator ADD MEMBER`, mixed
+mode, TCP/IP and port, SQL Browser, restart). Passwords, the encryption key and `HEALTHCHECK_URL` are written as
+`[hidden]`; the `sa` password is never logged. A run that stops before step 4 is logged only if the data folder
+already exists. The path is printed at the end, and when the installer stops.
 
 **When you have no sysadmin access at all** (no Windows sysadmin account and no `sa` password; e.g. the client's
 DBA manages SQL Server), press Ctrl+C at the login prompt to stop the installer at step 7. Then:

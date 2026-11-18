@@ -182,7 +182,9 @@ client's databases don't exist there yet. So:
    - Otherwise run `CREATE USER <q> FOR LOGIN <q>`.
    - Then: in `master`, `GRANT CREATE DATABASE TO <q>`. In each DB, `ALTER ROLE db_backupoperator ADD MEMBER <q>`,
      only if it isn't a member yet.
-   - Each step returns a status word (created, remapped, kept) for the summary.
+   - Each step returns what it did, for the summary and the install log: the user (created with its `CREATE USER`,
+     remapped, or kept) and then the grant (`GRANT CREATE DATABASE`, `ALTER ROLE ... ADD MEMBER`, already a member, or
+     dbo with nothing to grant).
 7. **Settings that need a restart.** All of these are detected first, and nothing is written yet:
    - Mixed mode: `SERVERPROPERTY('IsIntegratedSecurityOnly') = 1`. Fix: the `xp_instance_regwrite ... LoginMode, 2`
      from the brief.

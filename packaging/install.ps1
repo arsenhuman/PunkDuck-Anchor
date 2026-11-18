@@ -180,6 +180,118 @@ function Write-Step([string]$Text) {
     Write-Host "==> $Text" -ForegroundColor Cyan
 }
 
+# ---- Install log ----
+# Everything the installer does goes to <data folder>\logs\install-YYYYMMDD-HHmmss.log, one file per run, so the
+# work can be checked afterwards: every line it prints, every SQL statement with its parameters and result, every
+# change to the settings file, services, SQL Server network settings, folder permissions and the scheduled task,
+# and the output of the program commands it runs. Secrets never go to the log: passwords, the encryption key and
+# the Healthchecks URL are written as [hidden]. The data folder (and so the log) is readable by SYSTEM and
+# Administrators only. Lines from before the data folder exists (steps 1-3) are kept in memory and written first.
+# The program's own cleanup deletes only backup-*.log files, so install logs stay until deleted by hand.
+
+$script:LogFile = $null
+$script:LogBuffer = New-Object 'System.Collections.Generic.List[string]'
+$script:LogMuted = $false
+
+function Write-Log([string]$Message) {
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $lines = @("$Message" -split "`r?`n")
+    $text = "$stamp  $($lines[0])"
+    for ($i = 1; $i -lt $lines.Count; $i++) { $text += "`r`n                     $($lines[$i])" }
+    if ($script:LogFile) {
+        try {
+            [IO.File]::AppendAllText($script:LogFile, "$text`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        } catch {
+            # Never stop the install because of the log; say it once on the console.
+            $failed = $script:LogFile
+            $script:LogFile = $null
+            Microsoft.PowerShell.Utility\Write-Host "Could not write the install log $failed`: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        # Created here too: test/install-functions.ps1 loads only the functions, not the top-level lines.
+        if ($null -eq $script:LogBuffer) { $script:LogBuffer = New-Object 'System.Collections.Generic.List[string]' }
+        $script:LogBuffer.Add($text)
+    }
+}
+
+# Every Write-Host of this installer also goes to the install log (except while $script:LogMuted is set, for
+# the encryption key). It takes every parameter of the real Write-Host, and the installer removes it when it
+# ends (see the bottom of this file): under "irm | iex" it would otherwise stay in the technician's window.
+function Write-Host {
+    param(
+        [Parameter(Position = 0, ValueFromPipeline = $true, ValueFromRemainingArguments = $true)]$Object,
+        [switch]$NoNewline,
+        $Separator,
+        [ConsoleColor]$ForegroundColor,
+        [ConsoleColor]$BackgroundColor
+    )
+    process {
+        if (-not $script:LogMuted) {
+            $sep = if ($PSBoundParameters.ContainsKey('Separator')) { "$Separator" } else { ' ' }
+            $text = (@($Object) | ForEach-Object { "$_" }) -join $sep
+            if ($text -ne '') { Write-Log $text }
+        }
+        Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+    }
+}
+
+# Opens the log file in $Dir (created if needed) and writes the lines kept in memory so far.
+function Start-InstallLog([string]$Dir) {
+    if ($script:LogFile) { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+        $file = Join-Path $Dir ('install-' + (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture) + '.log')
+        $text = if ($script:LogBuffer.Count) { ($script:LogBuffer -join "`r`n") + "`r`n" } else { '' }
+        [IO.File]::AppendAllText($file, $text, (New-Object System.Text.UTF8Encoding($false)))
+        $script:LogBuffer.Clear()
+        $script:LogFile = $file
+        Write-Log "Install log: $file"
+    } catch {
+        Microsoft.PowerShell.Utility\Write-Host "Could not create the install log in $Dir`: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+# Settings whose values never go to the log.
+function Test-SecretSetting([string]$Key) {
+    return [bool]($Key -match '(PASSWORD|SECRET|TOKEN|_KEY$|^KEY$|HEALTHCHECK_URL)')
+}
+
+# A value as the log shows it: secrets as [hidden] (empty stays empty, so the log still says whether it is set).
+function Format-LogSetting([string]$Key, [string]$Value) {
+    if ((Test-SecretSetting $Key) -and $Value) { return '[hidden]' }
+    return $Value
+}
+
+# SQL parameters as the log shows them: the password hidden, long values (the grants script) shortened.
+function Format-SqlParamsForLog([hashtable]$Params) {
+    $parts = foreach ($k in ($Params.Keys | Sort-Object)) {
+        $v = [string]$Params[$k]
+        if ($k -match '^(pw|password)$') { $v = '[hidden]' }
+        elseif ($v.Length -gt 120) { $v = "<T-SQL script, $($v.Length) characters, see install.ps1>" }
+        "$k=$v"
+    }
+    return ($parts -join ', ')
+}
+
+# Label of a grants result line ($SqlUserGrantsInner) in the log: 'SQL Server change:' only when it changed
+# something, so a re-run that finds everything in place does not look like a change.
+function Get-GrantLogLabel([string]$Result) {
+    if ($Result -match '\b(created|remapped|GRANT|ALTER ROLE)\b') { return 'SQL Server change:' }
+    return 'SQL Server, no change:'
+}
+
+# The settings file as the log shows it: every KEY=value line, secrets hidden.
+function Write-SettingsToLog([string]$Path, [string]$Title) {
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') {
+            $key = $Matches[1]
+            $lines.Add("  $key=$(Format-LogSetting $key (Get-EnvValue $Path $key))")
+        }
+    }
+    Write-Log "$Title`n$($lines -join "`n")"
+}
+
 # QuickEdit mode of the classic console: a click in the window starts a text selection, and while a
 # selection is active every write to the console blocks, so the installer looks frozen until a key is
 # pressed. It is off for the install and the technician's setting is restored afterwards. It is turned
@@ -233,11 +345,20 @@ function Invoke-WithQuickEdit([scriptblock]$Body) {
 # data folder (--home for a client). Returns the exit code. Native stderr must not turn into terminating errors.
 function Invoke-App {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    Write-Log "Running: $Launcher $((@($HomeArgs) + @($Arguments)) -join ' ')"
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $Launcher @HomeArgs @Arguments | Out-Host
-        return $LASTEXITCODE
+        if ($Arguments -contains 'login') {
+            # Interactive (sign-in link, pasted address): stays attached to the console, not logged.
+            & $Launcher @HomeArgs @Arguments | Out-Host
+        } else {
+            # Shown and logged line by line; stderr too (the program's JSON log lines).
+            & $Launcher @HomeArgs @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+        }
+        $code = $LASTEXITCODE
+        Write-Log "Exit code $code"
+        return $code
     } finally {
         $ErrorActionPreference = $saved
     }
@@ -278,6 +399,7 @@ function Set-EnvValue([string]$Path, [string]$Key, [string]$Value) {
     }
     if (-not $found) { $lines.Add("$Key=$Value") }
     [IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log "Settings file changed: $Key=$(Format-LogSetting $Key $Value) ($Path)"
 }
 
 # SQL_INSTANCE values of the SQL Server instances on this machine: '' is the default instance.
@@ -313,6 +435,7 @@ function Lock-Folder([string]$Path) {
         & icacls.exe (Join-Path $Path '*') /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed below $Path" }
     }
+    Write-Log "Folder permissions: $Path owned by Administrators, full control for SYSTEM and Administrators only (inherited below)"
 }
 
 function Assert-Prerequisites {
@@ -364,6 +487,7 @@ function Get-Package {
         $zip = $ZipPath   # already resolved to a full path at startup
         $shaFile = "$zip.sha256"
         if (-not (Test-Path $shaFile)) { throw "Missing $shaFile next to the zip." }
+        Write-Log "Package from -ZipPath: $zip"
     } else {
         if (-not $Version) {
             $rel = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = "$AppName-installer" }
@@ -381,6 +505,7 @@ function Get-Package {
             Write-Host "Using already downloaded $zip"
         } else {
             Write-Host "Downloading $name ..."
+            Write-Log "Download: $base/$name -> $zip"
             Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $zip
             Invoke-WebRequest -UseBasicParsing -Uri "$base/$name.sha256" -OutFile $shaFile
         }
@@ -412,19 +537,28 @@ function Install-ProgramFiles([string]$Zip) {
         Remove-Item -Recurse -Force $staging
         throw 'The package is incomplete (node.exe or the launcher is missing).'
     }
-    if (Test-Path $InstallDir) { Rename-Item -Path $InstallDir -NewName "$AppName.old" }
+    $version = if (Test-Path (Join-Path $staging 'package.json')) {
+        try { (Get-Content -Raw (Join-Path $staging 'package.json') | ConvertFrom-Json).version } catch { '?' }
+    } else { '?' }
+    Write-Log "Extracted $Zip to $staging (version $version)"
+    if (Test-Path $InstallDir) {
+        Rename-Item -Path $InstallDir -NewName "$AppName.old"
+        Write-Log "Moved the previous program files to $old"
+    }
     try {
         Rename-Item -Path $staging -NewName $AppName
     } catch {
-        if (Test-Path $old) { Rename-Item -Path $old -NewName $AppName }
+        if (Test-Path $old) { Rename-Item -Path $old -NewName $AppName; Write-Log "Put the previous program files back in $InstallDir" }
         throw
     }
-    if (Test-Path $old) { Remove-Item -Recurse -Force $old }
+    Write-Log "Program files installed in $InstallDir (version $version)"
+    if (Test-Path $old) { Remove-Item -Recurse -Force $old; Write-Log "Removed $old" }
 }
 
 function Initialize-EnvFile {
     if (Test-Path $EnvFile) {
         Write-Host "Keeping existing settings: $EnvFile"
+        Write-SettingsToLog $EnvFile 'Settings (secrets hidden):'
         return
     }
     Copy-Item -Path (Join-Path $InstallDir "$AppName.env.template") -Destination $EnvFile
@@ -453,6 +587,7 @@ function Initialize-EnvFile {
     Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$EnvFile`"" -Wait
     # Windows 11 Notepad may return immediately (tabs in an already open window), so ask as well.
     Read-Host 'Press Enter when the file is saved' | Out-Null
+    Write-SettingsToLog $EnvFile 'Settings as saved by the technician (secrets hidden):'
 }
 
 function Initialize-EncryptionKey {
@@ -467,7 +602,9 @@ function Initialize-EncryptionKey {
     Write-Host '=====================================================================' -ForegroundColor Yellow
     Write-Host ' NEW ENCRYPTION KEY - shown only this once' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host "   $key" -ForegroundColor White
+    $script:LogMuted = $true
+    try { Write-Host "   $key" -ForegroundColor White } finally { $script:LogMuted = $false }
+    Write-Log '   [the key is shown on screen only; it is never logged]'
     Write-Host ''
     try {
         Set-Clipboard -Value $key -ErrorAction Stop
@@ -484,6 +621,7 @@ function Initialize-EncryptionKey {
             $answer = Read-Host 'Type SAVED when the key is stored in the password manager'
         } until ($answer -eq 'SAVED')
     }
+    Write-Log 'The technician typed SAVED (key stored in the password manager)'
 }
 
 function Register-BackupTask {
@@ -498,6 +636,7 @@ function Register-BackupTask {
         -ExecutionTimeLimit (New-TimeSpan -Hours 12) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
         -Settings $settings -Description 'Backs up SQL Server databases to Google Drive (backup-manager).' -Force | Out-Null
+    Write-Log "Scheduled task registered (replaced if it existed): '$TaskName', runs `"$Launcher`" $($Layout.TaskArguments) in $InstallDir, daily at $time as SYSTEM (highest privileges), time limit 12 h, starts late if missed, no second copy while one runs"
     Write-Host "Scheduled task '$TaskName': daily at $time as SYSTEM."
     # Several installs on one SQL Server should not all back up at the same minute.
     foreach ($o in @(Get-BackupTasks | Where-Object { $_.TaskName -ne $TaskName })) {
@@ -549,52 +688,56 @@ EXEC sys.sp_executesql @sql;
 # Runs $SqlUserGrantsInner in database @db (<db>.sys.sp_executesql runs in that database).
 $SqlInDatabase = @'
 DECLARE @proc nvarchar(300) = QUOTENAME(@db) + N'.sys.sp_executesql';
-DECLARE @result nvarchar(20);
-EXEC @proc @inner, N'@login sysname, @isMaster int, @result nvarchar(20) OUTPUT',
+DECLARE @result nvarchar(4000);
+EXEC @proc @inner, N'@login sysname, @isMaster int, @result nvarchar(4000) OUTPUT',
     @login = @login, @isMaster = @isMaster, @result = @result OUTPUT;
 SELECT @result;
 '@
 
 # In the current database: make sure a user maps to the login, then grant what backup-manager needs.
 # master: GRANT CREATE DATABASE (RESTORE VERIFYONLY needs it). Other databases: db_backupoperator.
-# Returns 'created', 'remapped' (orphaned user after a restore from another server) or 'kept'.
+# Returns what it did, for the summary and the install log: the user ('[x] created', '[x] remapped to the
+# login' for an orphaned user after a restore from another server, or '[x] kept'), then the permission.
 $SqlUserGrantsInner = @'
 DECLARE @sid varbinary(85) = SUSER_SID(@login);
 DECLARE @user sysname, @sql nvarchar(max);
 SELECT @user = name FROM sys.database_principals WHERE sid = @sid;
 IF @user IS NOT NULL
-    SET @result = N'kept';
+    SET @result = QUOTENAME(@user) + N' kept';
 ELSE IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @login)
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @login AND type = 'S')
         THROW 50001, N'A database principal with the name of SQL_USER exists but is not a SQL user. Choose another SQL_USER.', 1;
     SET @sql = N'ALTER USER ' + QUOTENAME(@login) + N' WITH LOGIN = ' + QUOTENAME(@login);
     EXEC sys.sp_executesql @sql;
-    SELECT @user = @login, @result = N'remapped';
+    SELECT @user = @login, @result = QUOTENAME(@login) + N' remapped to the login';
 END
 ELSE
 BEGIN
     SET @sql = N'CREATE USER ' + QUOTENAME(@login) + N' FOR LOGIN ' + QUOTENAME(@login);
     EXEC sys.sp_executesql @sql;
-    SELECT @user = @login, @result = N'created';
+    SELECT @user = @login, @result = QUOTENAME(@login) + N' created (' + @sql + N')';
 END
-IF @user <> N'dbo'
+IF @user = N'dbo'
+    SET @result = @result + N'; it is the database owner (dbo), nothing to grant';
+ELSE IF @isMaster = 1
 BEGIN
-    IF @isMaster = 1
-    BEGIN
-        SET @sql = N'GRANT CREATE DATABASE TO ' + QUOTENAME(@user);
-        EXEC sys.sp_executesql @sql;
-    END
-    ELSE IF NOT EXISTS (
-        SELECT 1 FROM sys.database_role_members rm
-        JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
-        JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
-        WHERE r.name = N'db_backupoperator' AND m.name = @user)
-    BEGIN
-        SET @sql = N'ALTER ROLE db_backupoperator ADD MEMBER ' + QUOTENAME(@user);
-        EXEC sys.sp_executesql @sql;
-    END
+    SET @sql = N'GRANT CREATE DATABASE TO ' + QUOTENAME(@user);
+    EXEC sys.sp_executesql @sql;
+    SET @result = @result + N'; ' + @sql;
 END
+ELSE IF NOT EXISTS (
+    SELECT 1 FROM sys.database_role_members rm
+    JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id
+    JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+    WHERE r.name = N'db_backupoperator' AND m.name = @user)
+BEGIN
+    SET @sql = N'ALTER ROLE db_backupoperator ADD MEMBER ' + QUOTENAME(@user);
+    EXEC sys.sp_executesql @sql;
+    SET @result = @result + N'; ' + @sql;
+END
+ELSE
+    SET @result = @result + N'; already in db_backupoperator';
 '@
 
 $SqlIntegratedOnly = 'SELECT CAST(SERVERPROPERTY(''IsIntegratedSecurityOnly'') AS int);'
@@ -725,7 +868,13 @@ function Get-TcpPortPlan([string]$Current, [string]$Wanted) {
 # Runs one constant T-SQL text with parameters. Strings go in as NVarChar, integers as Int.
 # Returns the rows, or the first column of the first row with -Scalar.
 function Invoke-SqlAdmin {
-    param([string]$DataSource, [string]$Sql, [hashtable]$Params = @{}, [switch]$Scalar)
+    param([string]$DataSource, [string]$Sql, [hashtable]$Params = @{}, [switch]$Scalar, [switch]$NoLog)
+    if (-not $NoLog) {
+        $who = if ($script:SqlAdminCredential) { "SQL login $($script:SqlAdminCredential.UserId)" } else { "Windows account $env:USERDOMAIN\$env:USERNAME" }
+        $text = (($Sql -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
+        $paramText = if ($Params.Count) { "`nparameters: $(Format-SqlParamsForLog $Params)" } else { '' }
+        Write-Log "SQL on $DataSource as $who`:`n$text$paramText"
+    }
     $csb = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
     $csb['Data Source'] = $DataSource
     $csb['Integrated Security'] = (-not $script:SqlAdminCredential)
@@ -756,19 +905,33 @@ function Invoke-SqlAdmin {
         }
         if ($Scalar) {
             $v = $cmd.ExecuteScalar()
-            if ($v -is [DBNull]) { return $null }
+            if ($v -is [DBNull]) { $v = $null }
+            if (-not $NoLog) { Write-Log "  result: $(if ($null -eq $v) { '(none)' } else { "$v" })" }
             return $v
         }
         $table = New-Object System.Data.DataTable
         $table.Load($cmd.ExecuteReader())
+        if (-not $NoLog) {
+            $shown = @($table.Rows | Select-Object -First 20 | ForEach-Object {
+                $r = $_
+                ($table.Columns | ForEach-Object { "$($_.ColumnName)=$($r[$_.ColumnName])" }) -join ', '
+            })
+            $more = if ($table.Rows.Count -gt 20) { "`n... $($table.Rows.Count - 20) more" } else { '' }
+            $body = if ($shown.Count) { "`n" + ($shown -join "`n") } else { '' }
+            Write-Log "  result: $($table.Rows.Count) row(s)$body$more"
+        }
         foreach ($row in $table.Rows) { $row }
     } catch {
         # .NET errors arrive wrapped (MethodInvocationException): find the SqlException and print
         # "Msg 262: ... | Msg 3013: ...", like the program prints SQL errors.
         $ex = $_.Exception
         while ($ex -and -not ($ex -is [System.Data.SqlClient.SqlException])) { $ex = $ex.InnerException }
-        if (-not $ex) { throw }
+        if (-not $ex) {
+            if (-not $NoLog) { Write-Log "  failed: $($_.Exception.Message)" }
+            throw
+        }
         $msgs = @($ex.Errors | ForEach-Object { "Msg $($_.Number): $($_.Message)" })
+        if (-not $NoLog) { Write-Log "  failed: $($msgs -join ' | ')" }
         throw ($msgs -join ' | ')
     } finally {
         $conn.Dispose()
@@ -776,15 +939,18 @@ function Invoke-SqlAdmin {
 }
 
 function Wait-SqlServer([string]$DataSource, [int]$TimeoutSeconds = 90) {
+    Write-Log "Waiting up to $TimeoutSeconds s for SQL Server ($DataSource) to accept connections"
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            Invoke-SqlAdmin -DataSource $DataSource -Sql $SqlPing -Scalar | Out-Null
+            Invoke-SqlAdmin -DataSource $DataSource -Sql $SqlPing -Scalar -NoLog | Out-Null
+            Write-Log 'SQL Server accepts connections'
             return $true
         } catch {
             Start-Sleep -Seconds 3
         }
     }
+    Write-Log "SQL Server did not accept connections within $TimeoutSeconds s"
     return $false
 }
 
@@ -854,8 +1020,10 @@ function Restart-SqlServer([hashtable]$Inst) {
     $dependents = @($svc.DependentServices | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
     Write-Host "Restarting $($Inst.ServiceName) ..."
     Stop-Service -Name $Inst.ServiceName -Force
+    Write-Log "Service stopped: $($Inst.ServiceName) (with its dependent services)"
     Start-Service -Name $Inst.ServiceName
-    foreach ($d in $dependents) { Start-Service -Name $d }
+    Write-Log "Service started: $($Inst.ServiceName)"
+    foreach ($d in $dependents) { Start-Service -Name $d; Write-Log "Service started: $d" }
     if (-not (Wait-SqlServer $Inst.DataSource 90)) {
         throw "SQL Server did not accept connections within 90 seconds after the restart. Check services.msc and the SQL Server error log."
     }
@@ -931,7 +1099,8 @@ function Connect-SqlAdminLogin([hashtable]$Inst) {
         }
         $pw = Read-Host "Password for $name" -AsSecureString
         $r = Connect-SqlLogin $Inst $name $pw
-        if ($r.Me) { return $r.Me }
+        # The name is logged only after it signed in: a password pasted into the name prompt never reaches the log.
+        if ($r.Me) { Write-Log "Signed in with the sysadmin login '$name' entered by the technician (the password is not logged)"; return $r.Me }
         Write-Host "$($r.Error)." -ForegroundColor Red
         if ($r.SignInFailed) {
             Write-Host 'Wrong password, the login is disabled, or SQL Server accepts only Windows sign-in (mixed mode off).' -ForegroundColor Yellow
@@ -969,6 +1138,7 @@ function Initialize-SqlServer {
     $databases = Split-DatabaseList (Get-EnvValue $EnvFile 'SQL_DATABASES')
     if ($databases.Count -eq 0) { throw "SQL_DATABASES is empty. Fix it in $EnvFile." }
     $summary = New-Object 'System.Collections.Generic.List[string]'
+    Write-Log "SQL Server preparation: instance $($inst.InstanceName) (service $($inst.ServiceName)), backup login $login, databases $($databases -join ', ')"
 
     # 1. The service
     $svc = Get-Service -Name $inst.ServiceName -ErrorAction SilentlyContinue
@@ -979,6 +1149,7 @@ function Initialize-SqlServer {
     if ($svc.Status -ne 'Running') {
         Write-Host "Starting $($inst.ServiceName) ..."
         Start-Service -Name $inst.ServiceName
+        Write-Log "Service started: $($inst.ServiceName)"
         if (-not (Wait-SqlServer $inst.DataSource 90)) { throw "SQL Server ($($inst.ServiceName)) did not start." }
     }
 
@@ -1023,6 +1194,7 @@ function Initialize-SqlServer {
         throw "A Windows login or group named '$login' exists. SQL_USER must be a SQL login: choose another SQL_USER in $EnvFile."
     }
     $plan = Get-SqlLoginPlan $login ([bool]$password) ([bool]$loginType) $DefaultSqlUser
+    Write-Log "Login plan for $login`: $($plan.Action) (login exists: $([bool]$loginType), SQL_PASSWORD set: $([bool]$password))"
     if ($plan.Action -eq 'error') { throw "$($plan.Message) ($EnvFile)" }
     if ($plan.Action -eq 'use') {
         $summary.Add("Login $login`: existing login from the env file used, its password and options not changed")
@@ -1038,19 +1210,25 @@ function Initialize-SqlServer {
             Remove-Variable pw -ErrorAction SilentlyContinue
         }
         $how = if ($generated) { 'random password stored in the env file' } else { 'password from the env file' }
+        $q = '[' + $login.Replace(']', ']]') + ']'   # as QUOTENAME() writes it
+        $ddl = if ($done -eq 'created') { "CREATE LOGIN $q WITH PASSWORD = '[hidden]', CHECK_POLICY = ON" } else { "ALTER LOGIN $q WITH PASSWORD = '[hidden]'" }
+        Write-Log "SQL Server change: login $login $done ($ddl; $how)"
         $summary.Add("Login $login`: $done ($how)")
         # Only for a login the installer manages: an expiry policy must never stop the nightly backups.
         Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlLoginOptions -Params @{ login = $login } | Out-Null
+        Write-Log "SQL Server change: login $login set to CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = [master], ENABLE"
     }
 
     # 5. Users and grants
     $r = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlInDatabase -Scalar `
         -Params @{ db = 'master'; inner = $SqlUserGrantsInner; login = $login; isMaster = 1 }
-    $summary.Add("master: user $r, CREATE DATABASE granted")
+    Write-Log "$(Get-GrantLogLabel $r) database master: user $r"
+    $summary.Add("master: user $r")
     foreach ($db in $databases) {
         $r = Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlInDatabase -Scalar `
             -Params @{ db = $db; inner = $SqlUserGrantsInner; login = $login; isMaster = 0 }
-        $summary.Add("$db`: user $r, db_backupoperator")
+        Write-Log "$(Get-GrantLogLabel $r) database $db`: user $r"
+        $summary.Add("$db`: user $r")
     }
 
     # 6. SQL Browser for a named instance found through it (no SQL Server restart needed)
@@ -1060,8 +1238,11 @@ function Initialize-SqlServer {
             throw "The SQL Server Browser service is not installed. Set SQL_PORT in $EnvFile to the fixed TCP port of $($inst.InstanceName) instead."
         }
         if ($browser.StartType -ne 'Automatic' -or $browser.Status -ne 'Running') {
+            Write-Log "SQL Server Browser was $($browser.StartType), $($browser.Status)"
             Set-Service -Name 'SQLBrowser' -StartupType Automatic
+            Write-Log 'Service changed: SQLBrowser startup type set to Automatic'
             Start-Service -Name 'SQLBrowser'
+            Write-Log 'Service started: SQLBrowser'
             $summary.Add('SQL Server Browser: set to Automatic and started')
         }
     }
@@ -1078,6 +1259,7 @@ function Initialize-SqlServer {
     }
     $ns = $found.Namespace
     $tcp = $found.Tcp
+    Write-Log "Network settings ($ns): mixed mode off: $mixedOff, TCP/IP enabled: $([bool]$tcp.Enabled)"
     if (-not $tcp.Enabled) { $changes.Add("Enable TCP/IP for $($inst.InstanceName)") }
 
     $portPlan = $null
@@ -1107,6 +1289,7 @@ function Initialize-SqlServer {
         Write-Host 'Applying this RESTARTS the SQL Server service. Everyone using this SQL Server' -ForegroundColor Yellow
         Write-Host "(the client's application too) is disconnected for about 30 seconds." -ForegroundColor Yellow
         $answer = Read-Host 'Type RESTART to apply now, or press Enter to stop and run the installer again later'
+        Write-Log "The technician answered '$answer' to the restart question"
         if ($answer -ne 'RESTART') {
             throw 'Nothing was changed in the SQL Server settings. Run the installer again when a restart is OK.'
         }
@@ -1114,15 +1297,18 @@ function Initialize-SqlServer {
         try {
             if ($mixedOff) {
                 Invoke-SqlAdmin -DataSource $inst.DataSource -Sql $SqlEnableMixedMode | Out-Null
+                Write-Log 'SQL Server change: LoginMode = 2 (SQL Server and Windows Authentication), active after the restart'
                 $applied.Add('mixed mode')
             }
             if (-not $tcp.Enabled) {
                 Assert-CimResult (Invoke-CimMethod -InputObject $tcp -MethodName 'SetEnable') 'Enabling TCP/IP'
+                Write-Log "SQL Server change: TCP/IP enabled for $($inst.InstanceName) (WMI $ns), active after the restart"
                 $applied.Add('TCP/IP')
             }
             if ($portPlan -and $portPlan.Action -eq 'set') {
                 Assert-CimResult (Invoke-CimMethod -InputObject $portProp -MethodName 'SetStringValue' -Arguments @{ StrValue = $portPlan.Port }) 'Setting the TCP port'
                 Assert-CimResult (Invoke-CimMethod -InputObject $dynProp -MethodName 'SetStringValue' -Arguments @{ StrValue = '' }) 'Clearing the dynamic TCP port'
+                Write-Log "SQL Server change: IPAll TcpPort = $($portPlan.Port) (was '$($portProp.PropertyStrVal)'), TcpDynamicPorts cleared (was '$($dynProp.PropertyStrVal)'), active after the restart"
                 $applied.Add("TCP port $($portPlan.Port)")
             }
         } catch {
@@ -1232,6 +1418,7 @@ function Write-InstallSummary([switch]$NoTask) {
     Write-Host "  Data folder: $DataDir"
     Write-Host "  Settings:    $EnvFile"
     Write-Host "  Logs:        $LogDir"
+    if ($script:LogFile) { Write-Host "  Install log: $($script:LogFile)" }
     if (-not $NoTask) { Write-Host "  Task:        $TaskName" }
     Write-Host "  Google:      $(Get-GoogleAccount $DataDir)"
     $homeText = if ($Layout.Client) { " --home '$DataDir'" } else { '' }
@@ -1260,6 +1447,7 @@ function Install-BackupManager {
     }
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
     Lock-Folder $DataDir   # before any secret is written there
+    Start-InstallLog $LogDir
     Initialize-EnvFile
 
     Write-Step '5/11 Encryption key'
@@ -1336,6 +1524,9 @@ if ($ZipPath) {
 Push-Location $env:SystemRoot   # never sit inside the folder we replace
 $savedConsoleMode = Set-QuickEdit $false
 try {
+    # A failed run must never log into the folder of an earlier run in the same window (irm | iex leaves globals).
+    $LogDir = $null
+    $DataDir = $null
     # -Client "" (e.g. an empty variable in a wrapper) is a mistake, not the default install. Under "irm | iex"
     # there are no bound parameters.
     $clientGiven = ($null -ne $PSBoundParameters) -and $PSBoundParameters.ContainsKey('Client')
@@ -1353,15 +1544,29 @@ try {
         $LogDir         = Join-Path $DataDir 'logs'
         $HomeArgs       = $Layout.HomeArgs
         $DefaultSqlUser = $Layout.DefaultSqlUser
+        $given = if ($PSBoundParameters) { @($PSBoundParameters.GetEnumerator() | ForEach-Object { "-$($_.Key) $($_.Value)" }) -join ' ' } else { '' }
+        if (-not $given) { $given = '(none)' }
+        Write-Log "Installer started by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME, Windows PowerShell $($PSVersionTable.PSVersion), parameters: $given"
         Install-BackupManager
+        Write-Log 'Installer finished successfully'
     }
 } catch {
     Write-Host ''
     Write-Host "INSTALL STOPPED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Log "Stopped at:`n$($_.ScriptStackTrace)"
     Write-Host 'Fix the problem and run the installer again; re-running is safe.' -ForegroundColor Yellow
+    # Stopped before step 4 opened the log: write what was kept in memory if the data folder exists (it is
+    # locked then). A new data folder is never created just for the log.
+    if (-not $script:LogFile -and $LogDir -and $DataDir -and (Test-Path $DataDir)) { Start-InstallLog $LogDir }
+    if ($script:LogFile) { Write-Host "Install log: $($script:LogFile)" -ForegroundColor Yellow }
     # Only exit when run as a file; under "irm | iex" exit would close the technician's window.
     if ($PSCommandPath) { exit 1 }
 } finally {
     Restore-ConsoleMode $savedConsoleMode
     Pop-Location
+    # Under "irm | iex" this file runs in the technician's global scope: leave no Write-Host proxy and no log
+    # state behind, so nothing printed in this window afterwards goes to the install log.
+    Remove-Item -Path Function:\Write-Host -ErrorAction SilentlyContinue
+    $script:LogFile = $null
+    $script:LogBuffer = $null
 }
