@@ -17,7 +17,7 @@ Drive**, encrypted, and we get an alert if backups stop.
 
 | # | What | Where to get it |
 |---|------|-----------------|
-| 1 | **RDP access** to the client's server, with a Windows account that is **Administrator** and **SQL Server sysadmin** (usually the account that installed SQL Server) | the client / our records |
+| 1 | **RDP access** to the client's server, with a Windows account that is **Administrator**, plus either that account being **SQL Server sysadmin** (usually the account that installed SQL Server) **or the `sa` password** (Mersoft installs usually have one) | the client / our records |
 | 2 | **The names of the databases** to back up | ask the client, or look in SSMS (see step 3) |
 | 3 | **The client's Gmail address**, and either its password or the client next to you to sign in | the client |
 | 4 | **A Healthchecks.io ping URL** for this client | create it, see below |
@@ -107,7 +107,15 @@ Type RESTART to apply now, or press Enter to stop and run the installer again la
   disconnected for about 30 seconds.
 - If not now: press **Enter**. Nothing is changed. Run the installer again later, when a restart is OK.
 
-If the installer says **"Your Windows account ... is not a sysadmin"**, see section 7.
+If your Windows account can't sign in to SQL Server or isn't a sysadmin, the installer asks for a SQL Server
+sysadmin login instead:
+
+```
+SQL Server sysadmin login (Enter for sa, or type SKIP to stop)
+```
+
+Press **Enter** for `sa` and type its password. It's used only for this step and isn't saved. You get 3 tries. If
+you don't have a sysadmin password, type `SKIP` and see section 7.
 
 ### Step 9/11: Google sign-in
 
@@ -160,6 +168,7 @@ The installer prints **INSTALL STOPPED:** in red with the reason. Fix it and run
 | `SQL Server service ... not found` | Wrong `SQL_INSTANCE`. It lists the instances on the machine. Fix it in the settings file* |
 | `The SQL login 'X' already exists, but SQL_PASSWORD is empty` | Enter that login's password in `SQL_PASSWORD`, **or** empty `SQL_USER` so the installer creates its own login |
 | `SQL Server refused the login` | `SQL_USER` / `SQL_PASSWORD` are wrong. Fix them, or empty both |
+| `Could not sign in as sa` | Wrong password, `sa` disabled, or SQL Server accepts only Windows sign-in. See section 7 |
 | `... is not a sysadmin` | See section 7 |
 | `The Google check failed` / wrong account | You signed in with the wrong Google account. Run the two `auth` commands below, then the installer again |
 | `A backup is running right now` | Wait until it finishes, then run the installer again |
