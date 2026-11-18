@@ -72,6 +72,20 @@ test('optional values: empty retention, monitoring off, explicit server name', (
   assert.equal(c.googleEmail, undefined);
 });
 
+test('SQL_LOCAL_BACKUP_DIR: empty = SQL_BACKUP_DIR; required for a remote SQL_HOST', () => {
+  const local = cfg({}).servers[0];
+  assert.equal(local.localBackupDir, path.resolve('C:\\Program Files\\Microsoft SQL Server\\MSSQL16.SQLEXPRESS\\MSSQL\\Backup'));
+
+  assert.throws(() => cfg({ SQL_HOST: 'sqlbox' }), /SQL_LOCAL_BACKUP_DIR is empty, but SQL_HOST "sqlbox" is another machine/);
+  const remote = cfg({ SQL_HOST: 'sqlbox', SQL_BACKUP_DIR: 'D:\\Backup', SQL_LOCAL_BACKUP_DIR: '/mnt/sqlbox-backup' }).servers[0];
+  assert.equal(remote.backupDir, 'D:\\Backup', 'SQL Server still writes to its own path');
+  assert.equal(remote.localBackupDir, path.resolve('/mnt/sqlbox-backup'));
+  assert.equal(remote.trustServerCertificate, false);
+
+  // Commands that never touch SQL Server (restore-only machine) do not need it.
+  assert.doesNotThrow(() => cfg({ SQL_HOST: 'sqlbox', SQL_PASSWORD: '', SQL_DATABASES: '', SQL_BACKUP_DIR: '' }, { requireSql: false }));
+});
+
 test('named instance uses SQL Browser unless a non-default SQL_PORT is set', () => {
   assert.equal(cfg({ SQL_INSTANCE: 'SQLEXPRESS' }).servers[0].instanceName, 'SQLEXPRESS'); // template's 1433
   assert.equal(cfg({ SQL_INSTANCE: 'SQLEXPRESS', SQL_PORT: '' }).servers[0].instanceName, 'SQLEXPRESS');
@@ -167,9 +181,10 @@ test('isLocalSqlHost: loopback names and this computer\'s name, case-insensitive
 test('SQL_TRUST_SERVER_CERTIFICATE defaults to true for a local SQL Server, false for a remote one; explicit wins', () => {
   assert.equal(cfg().servers[0].trustServerCertificate, true, 'localhost');
   assert.equal(cfg({ SQL_HOST: 'sql-box01' }).servers[0].trustServerCertificate, true, 'computer name');
-  assert.equal(cfg({ SQL_HOST: 'sqlbox' }).servers[0].trustServerCertificate, false, 'remote');
+  const share = { SQL_LOCAL_BACKUP_DIR: '/mnt/sqlbox-backup' };
+  assert.equal(cfg({ SQL_HOST: 'sqlbox', ...share }).servers[0].trustServerCertificate, false, 'remote');
   assert.equal(cfg({ SQL_TRUST_SERVER_CERTIFICATE: 'false' }).servers[0].trustServerCertificate, false, 'explicit false on localhost');
-  assert.equal(cfg({ SQL_HOST: 'sqlbox', SQL_TRUST_SERVER_CERTIFICATE: 'true' }).servers[0].trustServerCertificate, true, 'explicit true on remote');
+  assert.equal(cfg({ SQL_HOST: 'sqlbox', SQL_TRUST_SERVER_CERTIFICATE: 'true', ...share }).servers[0].trustServerCertificate, true, 'explicit true on remote');
   assert.equal(cfg().servers[0].encrypt, true, 'still encrypted');
 });
 

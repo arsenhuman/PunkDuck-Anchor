@@ -259,6 +259,43 @@ Common SQL Server traps, all detected by `backup-manager check`:
 | **Self-signed TLS certificate** | Not needed: trusted by default for a SQL Server on this machine | Remove `SQL_TRUST_SERVER_CERTIFICATE=false` from the env file |
 | **No backup compression on Express** | Not needed | Nothing to do: native compression stays off and the program compresses with gzip |
 
+### SQL Server on another machine
+
+backup-manager normally runs on the SQL Server machine. It can also run on a different machine with only a SQL login
+to the SQL Server, as long as a **network share** connects the two. `BACKUP DATABASE` always writes the `.bak` on
+the SQL Server's own machine, and backup-manager has to read and delete that file.
+
+What the client's IT sets up once on the SQL Server machine (there is no need to sign in to it after that):
+
+1. Prepare SQL Server with `sql-prepare.sql` (login, permissions, mixed mode, TCP/IP). The installer can't do this
+   for a remote SQL Server.
+2. Share the backup folder, e.g. `D:\Backup` as `\\sqlhost\Backup`. SQL Server's service account writes there.
+   The backup-manager machine needs **read and delete** rights on the share.
+3. Allow TCP 1433 (or the instance's port) through the firewall from the backup-manager machine.
+
+In the env file on the backup-manager machine:
+
+```
+SQL_HOST=sqlhost
+SQL_USER=backup_user
+SQL_PASSWORD=...
+SQL_BACKUP_DIR=D:\Backup               # the folder as SQL Server sees it
+SQL_LOCAL_BACKUP_DIR=\\sqlhost\Backup  # the same folder as this machine sees it
+```
+
+Then run the installer as usual. Step 7 only prints these instructions. `check` tests that the share is readable
+and deletable, and the first backup proves that the two paths are really the same folder.
+
+Limits:
+
+- **The nightly task runs as SYSTEM.** On the network that is the computer account (`DOMAIN\<computer>$`), so
+  the share must grant it rights, and this **only works in an Active Directory domain**. In a workgroup, SYSTEM
+  can't sign in to another machine's share. `check` and the first backup during install run as you, so they can
+  pass while the nightly run fails. Check the next morning's log.
+- SQL Server's certificate is self-signed by default, and a remote connection doesn't trust it automatically. Add
+  `SQL_TRUST_SERVER_CERTIFICATE=true` if `check` reports a certificate error.
+- With no share at all (a SQL login is the only access), native `.bak` backups aren't possible.
+
 ## Settings: `backup-manager.env`
 
 The env file is the **only** supported configuration. Format: `KEY=VALUE`, `#` starts a comment line.
@@ -269,12 +306,13 @@ The template, with instructions for the technician, is
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `SQL_HOST` | `localhost` | SQL Server host. It must run on this machine (the program reads the `.bak` from `SQL_BACKUP_DIR`) |
+| `SQL_HOST` | `localhost` | SQL Server host. For a SQL Server on another machine, also set `SQL_LOCAL_BACKUP_DIR` (see *SQL Server on another machine*) |
 | `SQL_PORT` | `1433` | TCP port. With `SQL_INSTANCE` set, a value other than 1433 means "connect to this port directly, skip SQL Browser" |
 | `SQL_INSTANCE` | (none) | Named instance: the part after `MSSQL$` in the service name, e.g. `SQLEXPRESS`. Empty for the default instance (`MSSQLSERVER`). Found through the SQL Browser service |
 | `SQL_USER`, `SQL_PASSWORD` | filled in by the installer | SQL login. Leave both empty and the installer creates `backup_user` and writes both here; or enter an existing login and its password to use that one (see *SQL Server preparation*). A restore-only machine doesn't need them |
 | `SQL_DATABASES` | required | Comma-separated database names, as shown in SSMS. A restore-only machine doesn't need it |
-| `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to. A restore-only machine doesn't need it |
+| `SQL_BACKUP_DIR` | filled in by the installer | Folder SQL Server writes backups to, as SQL Server sees it. A restore-only machine doesn't need it |
+| `SQL_LOCAL_BACKUP_DIR` | `SQL_BACKUP_DIR` | Only for a remote `SQL_HOST`, and required then: the same folder as a network share seen from this machine, e.g. `\\sqlhost\Backup` |
 | `SERVER_NAME` | computer name | Drive sub-folder name (`A-Z a-z 0-9 . _ -`) |
 | `GOOGLE_EMAIL` | (none) | Expected Google account; used as the sign-in hint, and `check` fails if a different account is signed in |
 | `BACKUP_TIME` | `02:00` | Daily start time (24-hour `HH:MM`), used by the installer for the scheduled task. Re-run the installer after changing it |

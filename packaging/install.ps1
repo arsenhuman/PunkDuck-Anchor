@@ -658,7 +658,13 @@ function Initialize-SqlServer {
     $sqlHost = Get-EnvValue $EnvFile 'SQL_HOST'
     if (-not $sqlHost) { $sqlHost = 'localhost' }
     if (-not (Test-LocalSqlHost $sqlHost)) {
-        Write-Host "SQL_HOST=$sqlHost is not this machine: skipping SQL Server preparation."
+        Write-Host "SQL_HOST=$sqlHost is not this machine: SQL Server there is not prepared by the installer." -ForegroundColor Yellow
+        Write-Host '  On that SQL Server a sysadmin runs sql-prepare.sql (login, permissions, mixed mode, TCP/IP):' -ForegroundColor Yellow
+        Write-Host "    $SqlPrepareScript" -ForegroundColor Yellow
+        Write-Host '  In the env file fill in SQL_USER, SQL_PASSWORD, SQL_BACKUP_DIR (the backup folder on that machine)' -ForegroundColor Yellow
+        Write-Host '  and SQL_LOCAL_BACKUP_DIR (the same folder as a network share, e.g. \\sqlhost\Backup).' -ForegroundColor Yellow
+        Write-Host '  The nightly task runs as SYSTEM: on the share, this computer''s account (DOMAIN\<computer>$) needs' -ForegroundColor Yellow
+        Write-Host '  read and delete rights, which only works in a domain. The first backup below runs as you, not as SYSTEM.' -ForegroundColor Yellow
         return
     }
     $inst = Resolve-SqlInstance (Get-EnvValue $EnvFile 'SQL_INSTANCE') (Get-EnvValue $EnvFile 'SQL_PORT')
