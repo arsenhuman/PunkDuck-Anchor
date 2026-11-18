@@ -199,7 +199,7 @@ test('requireSql: false lets SQL_DATABASES and SQL_BACKUP_DIR be empty (restore-
   assert.deepEqual(s.databases, []);
   assert.equal(s.backupDir, '');
   assert.throws(() => cfg({ SQL_DATABASES: '' }), /SQL_DATABASES is empty/);
-  assert.throws(() => cfg({ SQL_BACKUP_DIR: '' }), /SQL_BACKUP_DIR is empty \(the installer fills it in/);
+  assert.throws(() => cfg({ SQL_BACKUP_DIR: '' }), /SQL_BACKUP_DIR is empty \(set it to the folder SQL Server writes backups to/);
 });
 
 test('the packaged env template has no client-specific SQL defaults', async () => {
@@ -214,4 +214,11 @@ test('the packaged env template has no client-specific SQL defaults', async () =
 
 test('requireSql: false lets SQL_USER be empty too (restore-only machine)', () => {
   assert.equal(cfg({ SQL_USER: '', SQL_PASSWORD: '' }, { requireSql: false }).servers[0].user, '');
+});
+
+test('parseEnvText reads back what install.ps1 Format-EnvValue writes (single quotes, backticks)', () => {
+  const v = parseEnvText("SQL_BACKUP_DIR='D:\\SQL#Backups'\r\nSQL_HOST=`D:\\it's#x`\r\nSQL_USER=' x'\r\n");
+  assert.equal(v.SQL_BACKUP_DIR, 'D:\\SQL#Backups');
+  assert.equal(v.SQL_HOST, "D:\\it's#x");
+  assert.equal(v.SQL_USER, ' x');
 });

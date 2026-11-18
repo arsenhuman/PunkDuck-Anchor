@@ -98,7 +98,7 @@ test('loopback server can be closed early', async () => {
 
 test('browserCommand opens the URL without a shell on every platform', () => {
   const url = 'https://accounts.google.com/o/oauth2/v2/auth?a=1&b=2';
-  assert.deepEqual(browserCommand(url, 'win32'), { cmd: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', url] });
+  assert.deepEqual(browserCommand(url, 'win32'), { cmd: 'explorer.exe', args: [url] });
   assert.deepEqual(browserCommand(url, 'darwin'), { cmd: 'open', args: [url] });
   assert.deepEqual(browserCommand(url, 'linux'), { cmd: 'xdg-open', args: [url] });
 });
@@ -108,6 +108,6 @@ test('openBrowser spawns detached and never throws', () => {
   const child = { on: (ev, fn) => calls.push(['on', ev, typeof fn]), unref: () => calls.push(['unref']) };
   const ok = openBrowser('https://x/?a=1&b=2', { platform: 'win32', spawnFn: (cmd, args, o) => { calls.push([cmd, args, o.detached, o.stdio]); return child; } });
   assert.equal(ok, true);
-  assert.deepEqual(calls, [['rundll32.exe', ['url.dll,FileProtocolHandler', 'https://x/?a=1&b=2'], true, 'ignore'], ['on', 'error', 'function'], ['unref']]);
+  assert.deepEqual(calls, [['explorer.exe', ['https://x/?a=1&b=2'], true, 'ignore'], ['on', 'error', 'function'], ['unref']]);
   assert.equal(openBrowser('https://x', { spawnFn: () => { throw new Error('ENOENT'); } }), false);
 });
