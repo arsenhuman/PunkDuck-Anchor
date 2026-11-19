@@ -8,11 +8,10 @@ It:
 1. tells SQL Server to make a full backup (`.bak`) of each database, into SQL Server's backup folder;
 2. compresses and **encrypts** the `.bak` with the client's key;
 3. uploads it to the **client's own Google Drive** (folder **MSSQL Backups**) and deletes the local copy;
-4. deletes old backups on Drive (keeps the newest 7 + everything from the last 30 days);
-5. pings **Healthchecks.io**. If the ping doesn't come, Healthchecks alerts us.
+4. deletes old backups on Drive (keeps the newest 7 + everything from the last 30 days).
 
-The installer sets all of this up in one go. Backups can only be restored with the encryption key, which lives in
-our password manager.
+The installer sets all of this up in one go. Backups can only be restored with the encryption key. **The client
+keeps the key, not us.**
 
 ## Before you start
 
@@ -29,16 +28,11 @@ our password manager.
   locations* → copy **Backup**. Or new query: `SELECT SERVERPROPERTY('InstanceDefaultBackupPath');`
   Usually `C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup`.
 
-**3. Create the Healthchecks.io check**
-- Healthchecks.io → **Add Check** → name it after the client.
-- **Period = 1 day**, **Grace Time = 4 days**.
-- Copy the **ping URL** (`https://hc-ping.com/...`).
-
-**4. From the client**
+**3. From the client**
 - Their **Gmail** address, and either the password or the client next to you to sign in.
 - OK for a **~30-second SQL Server restart** (may be needed once, during install).
-
-**5. Open the company password manager.** You'll save the encryption key there.
+- A **flash drive** or another place outside this server (their PC, their password manager) to keep the
+  encryption key.
 
 ## Step 1: Paste the command
 
@@ -72,7 +66,6 @@ Notepad. PowerShell lists the SQL instances it found. Write each value right aft
 SQL_DATABASES=EXAMPLE
 SQL_INSTANCE=MERSOFT11
 GOOGLE_EMAIL=client@gmail.com
-HEALTHCHECK_URL=https://hc-ping.com/1234abcd-...
 SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup
 ```
 
@@ -81,13 +74,13 @@ SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Bac
 | `SQL_DATABASES` | Which databases get backed up. Several: `EXAMPLE,EXAMPLE2`. |
 | `SQL_INSTANCE` | Which SQL Server on this machine. Leave empty for the default instance. |
 | `GOOGLE_EMAIL` | Whose Drive the backups go to. Sign-in with another account is refused. |
-| `HEALTHCHECK_URL` | Where to ping after every backup, so we get alerted when backups stop. |
 | `SQL_BACKUP_DIR` | Where SQL Server writes the `.bak` before upload. If you leave it empty, the installer asks SQL Server. |
 
 **Leave empty:**
 - `SQL_USER` / `SQL_PASSWORD`: the installer creates SQL login `backup_user` (backup rights only, random password)
   and writes it here. The nightly task uses this login. Fill in only if the client's IT gave you a login.
 - `BACKUP_ENCRYPTION_KEY`: generated in the next step.
+- `HEALTHCHECK_URL`: we don't use it.
 
 **Leave as is:** `BACKUP_TIME=02:00` (nightly start), `KEEP_LAST=7`, `KEEP_DAYS=30` (retention on Drive),
 `SQL_HOST=localhost`, `SQL_PORT=1433`, `SQL_LOCAL_BACKUP_DIR` and `SERVER_NAME` (empty = computer name as Drive
@@ -95,15 +88,17 @@ folder).
 
 **Ctrl+S**, close Notepad, back in PowerShell press **Enter**.
 
-## Step 4: Save the encryption key
+## Step 4: Give the encryption key to the client
 
 **5/11**: a yellow box shows the key. **It's shown only once** and is already in the clipboard.
 
-1. Password manager → this client → new entry "Backup encryption key" → **Ctrl+V**.
-2. Compare with the screen.
+1. Paste it (**Ctrl+V**) into a text file **on the client's flash drive**, or let the client copy it somewhere
+   safe that is **not this server** (their PC, their password manager, a printed copy).
+2. Compare it with the screen.
 3. Type `SAVED`, press **Enter**.
 
-Why: every backup is encrypted with this key. Lose it and the backups are useless.
+Tell the client: every backup is encrypted with this key. **We don't keep it.** If they lose it and the server dies,
+the backups can't be restored. Don't save it on this server only: if the server is lost, the key is lost with it.
 
 **6/11**: the installer locks its folders to SYSTEM and Administrators. Nothing to do.
 
@@ -152,7 +147,7 @@ Done when it says in green:
 backup-manager is installed and the first backup succeeded.
 ```
 
-Check: Healthchecks.io is green, the client's Drive has **MSSQL Backups** with the backup inside.
+Check: the client's Drive has **MSSQL Backups** with the backup inside.
 
 **Red `INSTALL STOPPED`?** It says what's wrong. Fix it (settings:
 `notepad C:\ProgramData\backup-manager\backup-manager.env`) and paste the command from Step 1 again. Rerunning is
