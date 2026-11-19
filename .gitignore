@@ -9,3 +9,4 @@ token.json
 *.partial
 dist/
 oauth-client.json
+*.swp
