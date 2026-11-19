@@ -17,7 +17,7 @@ keeps the key, not us.**
 ## Before you start
 
 **1. Get access**
-- RDP to the client's server with a Windows account that is **Administrator**.
+- RDP to the client's server with a Windows account that is **Administrator**(e.g. AnyDesk).
 - That account should open **SSMS with Windows Authentication** (usually the account that installed SQL Server).
   The installer uses it to set up SQL Server. If it can't, get the **`sa` password** from our records.
 
