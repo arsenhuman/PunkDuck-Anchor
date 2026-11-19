@@ -1,92 +1,166 @@
 # Backup Manager: install on a client's server
 
-**Have ready:** RDP admin access, the client's Gmail (+ password), a Healthchecks.io ping URL for the client
-(Period 1 day, Grace 4 days), the password manager, the client's OK for a 30-second SQL Server restart.
+## How it works
 
-Log in to Windows with the account that opens **SSMS with Windows Authentication**. The installer uses it to set up
-SQL Server. If it can't, have the `sa` password ready.
+Backup Manager is a small program installed on the client's server. Every night Windows Task Scheduler starts it.
+It:
 
-## Before you paste: look up 3 things in SSMS
+1. tells SQL Server to make a full backup (`.bak`) of each database, into SQL Server's backup folder;
+2. compresses and **encrypts** the `.bak` with the client's key;
+3. uploads it to the **client's own Google Drive** (folder **MSSQL Backups**) and deletes the local copy;
+4. deletes old backups on Drive (keeps the newest 7 + everything from the last 30 days);
+5. pings **Healthchecks.io**. If the ping doesn't come, Healthchecks alerts us.
 
-In SSMS, connected to the server:
+The installer sets all of this up in one go. Backups can only be restored with the encryption key, which lives in
+our password manager.
 
-- **Instance name:** the top line in Object Explorer, e.g. `SERVER01\MERSOFT11`. The part after `\` is the
-  instance: `MERSOFT11`. No `\` = default instance.
-- **Database names:** under **Databases** (not System Databases), e.g. `EXAMPLE`.
-- **Backup folder:** right-click the server (top line) → **Properties** → **Database Settings** → under
-  *Database default locations*, copy **Backup**. Usually
-  `C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup`.
-  Or run in a new query: `SELECT SERVERPROPERTY('InstanceDefaultBackupPath');`
+## Before you start
 
-## Run the installer
+**1. Get access**
+- RDP to the client's server with a Windows account that is **Administrator**.
+- That account should open **SSMS with Windows Authentication** (usually the account that installed SQL Server).
+  The installer uses it to set up SQL Server. If it can't, get the **`sa` password** from our records.
 
-Open **PowerShell as Administrator** and paste:
+**2. Look up 3 things in SSMS** (connect with Windows Authentication)
+- **Instance name:** the top line in Object Explorer, e.g. `SERVER01\MERSOFT11` → the part after `\`:
+  `MERSOFT11`. No `\` = default instance.
+- **Database names:** expand **Databases** (ignore *System Databases*), e.g. `EXAMPLE`. Exact spelling.
+- **Backup folder:** right-click the top line → **Properties** → **Database Settings** → *Database default
+  locations* → copy **Backup**. Or new query: `SELECT SERVERPROPERTY('InstanceDefaultBackupPath');`
+  Usually `C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup`.
+
+**3. Create the Healthchecks.io check**
+- Healthchecks.io → **Add Check** → name it after the client.
+- **Period = 1 day**, **Grace Time = 4 days**.
+- Copy the **ping URL** (`https://hc-ping.com/...`).
+
+**4. From the client**
+- Their **Gmail** address, and either the password or the client next to you to sign in.
+- OK for a **~30-second SQL Server restart** (may be needed once, during install).
+
+**5. Open the company password manager.** You'll save the encryption key there.
+
+## Step 1: Paste the command
+
+Start → type `powershell` → right-click **Windows PowerShell** → **Run as administrator** → Yes. Paste both lines
+(right-click pastes) and press **Enter**:
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
 irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 | iex
 ```
 
-Don't click inside the window while it runs (title starts with "Select" → press **Esc**).
-If it stops with red **INSTALL STOPPED**, fix what it says and paste the command again. Rerunning is always safe.
+The first line enables TLS 1.2 (old Windows Servers need it to reach GitHub). The second downloads and runs the
+installer.
 
-## What happens in each step
+Don't click inside the window while it runs. If the title starts with "Select", press **Esc**.
 
-| Step | What the installer does | What you do |
-|------|-------------------------|-------------|
-| **1/11** Prerequisites | Checks Windows version, 64-bit, admin rights. | Nothing. |
-| **2/11** Package | Downloads the latest release from GitHub and verifies its checksum. | Nothing. |
-| **3/11** Program files | Installs to `C:\Program Files\backup-manager`. | Nothing. |
-| **4/11** Settings | Creates `C:\ProgramData\backup-manager\backup-manager.env`, opens it in Notepad, lists the SQL instances found. | **Fill in the .env** (see below), save, close Notepad, press **Enter**. |
-| **5/11** Encryption key | Generates the key that encrypts every backup and shows it **once** (already copied to clipboard). | Paste it into the password manager under the client as "Backup encryption key", type `SAVED`. **No key = no restore.** |
-| **6/11** Folder access | Locks the program and settings folders to SYSTEM and Administrators. | Nothing. |
-| **7/11** SQL Server | Signs in with your Windows account. Checks the databases exist. Creates SQL login `backup_user` (backup rights only) and writes its password into the .env. Enables mixed authentication mode and TCP/IP if they're off. | If asked, type `RESTART` (~30 s downtime) or Enter to stop and rerun later. If your Windows account isn't sysadmin: Enter for `sa`, type its password (not saved). |
-| **8/11** Check | Tests the settings, the SQL connection with `backup_user` and the backup folder. | Nothing. |
-| **9/11** Google | Opens the Google sign-in in a browser. Then checks it's the account from `GOOGLE_EMAIL`. | Sign in with the **client's** Gmail, click Continue/Allow. No browser? Open the printed link on your laptop, sign in, copy the full URL of the "can't be reached" page and paste it into PowerShell. |
-| **10/11** Task | Creates the nightly task "PunkDuck Backup Manager" in Task Scheduler (runs as SYSTEM). | Nothing. |
-| **11/11** First backup | Backs up, compresses, encrypts and uploads to the client's Drive (folder **MSSQL Backups**). | Wait, don't close the window. Can take up to an hour. |
+## Step 2: The installer starts working
 
-Done when it says in green: `backup-manager is installed and the first backup succeeded.` Then check that the
-Healthchecks.io check is green.
+It goes through 11 steps and prints each one. The first three need nothing from you:
 
-## The .env file: what each field is for
+- **1/11** checks Windows version, 64-bit, admin rights;
+- **2/11** downloads the latest release from GitHub and verifies its checksum;
+- **3/11** installs the program to `C:\Program Files\backup-manager`.
 
-Write the value right after `=`, no spaces, no quotes. Reopen later with
-`notepad C:\ProgramData\backup-manager\backup-manager.env`.
+## Step 3: Notepad opens the .env file
 
-**You fill in:**
+**4/11**: the installer creates the settings file `C:\ProgramData\backup-manager\backup-manager.env` and opens it in
+Notepad. PowerShell lists the SQL instances it found. Write each value right after `=`, no spaces, no quotes:
 
-| Field | What it's for | Example |
-|-------|---------------|---------|
-| `SQL_DATABASES` | Which databases get backed up. Comma-separated, exact SSMS names. | `SQL_DATABASES=EXAMPLE` |
-| `SQL_INSTANCE` | Which SQL Server instance on this machine. Empty = default instance. | `SQL_INSTANCE=MERSOFT11` |
-| `SQL_BACKUP_DIR` | Folder where SQL Server writes the `.bak` before it's encrypted and uploaded. Paste the backup folder from SSMS. (If empty, the installer asks SQL Server for it.) | `SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup` |
-| `GOOGLE_EMAIL` | Client's Google account. Backups go to its Drive. The installer refuses another account at sign-in. | `GOOGLE_EMAIL=client@gmail.com` |
-| `HEALTHCHECK_URL` | Pinged after every backup. If pings stop, Healthchecks.io alerts us. | `HEALTHCHECK_URL=https://hc-ping.com/1234abcd-...` |
+```
+SQL_DATABASES=EXAMPLE
+SQL_INSTANCE=MERSOFT11
+GOOGLE_EMAIL=client@gmail.com
+HEALTHCHECK_URL=https://hc-ping.com/1234abcd-...
+SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Backup
+```
 
-**Leave empty, the installer fills them in:**
+| Field | Why |
+|-------|-----|
+| `SQL_DATABASES` | Which databases get backed up. Several: `EXAMPLE,EXAMPLE2`. |
+| `SQL_INSTANCE` | Which SQL Server on this machine. Leave empty for the default instance. |
+| `GOOGLE_EMAIL` | Whose Drive the backups go to. Sign-in with another account is refused. |
+| `HEALTHCHECK_URL` | Where to ping after every backup, so we get alerted when backups stop. |
+| `SQL_BACKUP_DIR` | Where SQL Server writes the `.bak` before upload. If you leave it empty, the installer asks SQL Server. |
 
-| Field | What it's for |
-|-------|---------------|
-| `SQL_USER` / `SQL_PASSWORD` | SQL login the nightly backup uses. Installer creates `backup_user` with a random password. Fill in only if the client's IT gave you a login. |
-| `BACKUP_ENCRYPTION_KEY` | The key from step 5. **Never change it.** |
+**Leave empty:**
+- `SQL_USER` / `SQL_PASSWORD`: the installer creates SQL login `backup_user` (backup rights only, random password)
+  and writes it here. The nightly task uses this login. Fill in only if the client's IT gave you a login.
+- `BACKUP_ENCRYPTION_KEY`: generated in the next step.
 
-**Defaults, change only if needed:**
+**Leave as is:** `BACKUP_TIME=02:00` (nightly start), `KEEP_LAST=7`, `KEEP_DAYS=30` (retention on Drive),
+`SQL_HOST=localhost`, `SQL_PORT=1433`, `SQL_LOCAL_BACKUP_DIR` and `SERVER_NAME` (empty = computer name as Drive
+folder).
 
-| Field | What it's for | Default |
-|-------|---------------|---------|
-| `BACKUP_TIME` | Nightly start time (24 h). | `02:00` |
-| `KEEP_LAST` | Always keep at least this many newest backups on Drive. | `7` |
-| `KEEP_DAYS` | Also keep every backup younger than this. Older ones are deleted. | `30` |
-| `SQL_HOST` | Machine with SQL Server. `localhost` = this one. | `localhost` |
-| `SQL_PORT` | SQL Server TCP port. | `1433` |
-| `SQL_LOCAL_BACKUP_DIR` | Only when SQL Server is on another machine: the backup folder as a network share. | empty |
-| `SERVER_NAME` | Folder name on Google Drive. Empty = computer name. | empty |
+**Ctrl+S**, close Notepad, back in PowerShell press **Enter**.
 
-## Backups
+## Step 4: Save the encryption key
 
-They run automatically every night at `BACKUP_TIME`. To back up by hand (e.g. before a software update), in
-PowerShell as Administrator:
+**5/11**: a yellow box shows the key. **It's shown only once** and is already in the clipboard.
+
+1. Password manager → this client → new entry "Backup encryption key" → **Ctrl+V**.
+2. Compare with the screen.
+3. Type `SAVED`, press **Enter**.
+
+Why: every backup is encrypted with this key. Lose it and the backups are useless.
+
+**6/11**: the installer locks its folders to SYSTEM and Administrators. Nothing to do.
+
+## Step 5: SQL Server setup
+
+**7/11**: the installer signs in to SQL Server **with your Windows account**, checks the databases exist, reads the
+backup folder, and creates the `backup_user` login with backup rights on your databases.
+
+- If mixed authentication mode or TCP/IP is off, it lists the changes and asks for `RESTART`. Type it (users are
+  disconnected ~30 s), or press Enter to stop and paste the command again later.
+  Why: `backup_user` is a SQL login, so SQL Server must accept SQL logins too. Windows Authentication keeps working.
+- If your Windows account isn't a SQL sysadmin, it asks `SQL Server sysadmin login (Enter for sa)`: press **Enter**,
+  type the `sa` password. Used only now, not saved.
+
+**8/11**: tests the settings, the SQL connection as `backup_user`, and the backup folder.
+
+## Step 6: Google sign-in
+
+**9/11**: why: the program needs permission to upload to the client's Drive. It can only see files it created itself,
+nothing else in their Drive.
+
+A browser opens with the Google sign-in:
+
+1. Sign in with the **client's** Gmail (the one in `GOOGLE_EMAIL`).
+2. "Google hasn't verified this app" → **Continue**. Permissions → **Allow** / **Continue**.
+3. Browser says sign-in complete → back to PowerShell, it continues by itself.
+
+**Browser didn't open, or Windows Server blocks Google** (common):
+
+1. PowerShell prints a long link. Select it with the mouse and press **Enter** to copy.
+2. Open it on **your own laptop**, sign in with the client's account, allow.
+3. The page then shows **"This site can't be reached"**. That's expected.
+4. Copy the **whole address** from the address bar, paste it into PowerShell (**Ctrl+V**), press **Enter**.
+
+Then the installer checks it's the right account.
+
+## Step 7: Task and first backup
+
+**10/11**: creates the nightly task **"PunkDuck Backup Manager"** in Task Scheduler (runs as SYSTEM at `BACKUP_TIME`).
+
+**11/11**: runs the first backup. Up to an hour on big databases. Don't close the window.
+
+Done when it says in green:
+
+```
+backup-manager is installed and the first backup succeeded.
+```
+
+Check: Healthchecks.io is green, the client's Drive has **MSSQL Backups** with the backup inside.
+
+**Red `INSTALL STOPPED`?** It says what's wrong. Fix it (settings:
+`notepad C:\ProgramData\backup-manager\backup-manager.env`) and paste the command from Step 1 again. Rerunning is
+always safe: it keeps what's done.
+
+## Backups by hand
+
+Nightly backups are automatic. To back up now (e.g. before a software update), PowerShell as Administrator:
 
 ```powershell
 $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
