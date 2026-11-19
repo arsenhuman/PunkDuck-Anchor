@@ -22,7 +22,7 @@ it runs (if the title starts with "Select", press **Esc**).
 
 ## 2. Fill in the .env file
 
-Notepad opens `backup-manager.env`. PowerShell lists the SQL instances and databases it found on this server.
+Notepad opens `backup-manager.env`. PowerShell lists the SQL instances it found on this server.
 Write each value right after `=`, no spaces, no quotes.
 
 | Line | What to write |
