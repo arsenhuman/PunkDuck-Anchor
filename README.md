@@ -13,7 +13,7 @@ them, compressed and encrypted, to the **client's own Google Drive**.
 - **Scheduling:** Windows Task Scheduler, task **"PunkDuck Backup Manager"** (a client installed with `-Client X`:
   **"PunkDuck Backup Manager (X)"**), daily, as SYSTEM.
 - **Monitoring:** Healthchecks.io, one check per client.
-- **Restores:** always done by our team. See [RESTORE.md](RESTORE.md).
+- **Restores:** always done by our team. See [TUTORIAL.md, Restore](TUTORIAL.md#restore).
 
 What one backup run does for each database:
 
@@ -145,7 +145,7 @@ plain `irm | iex` takes no options and always works on the default install):
 | --- | --- |
 | `-Version 1.2.0` | Install that release instead of the latest |
 | `-ZipPath .\backup-manager-1.2.0-win-x64.zip` | Offline install when GitHub is blocked: copy the zip **and** its `.sha256` into the same folder first |
-| `-RestoreOnly` | Restore machine for another client's backups: no SQL Server preparation or SQL checks, no scheduled task, no backup. See [RESTORE.md](RESTORE.md) |
+| `-RestoreOnly` | Restore machine for another client's backups: no SQL Server preparation or SQL checks, no scheduled task, no backup. See [TUTORIAL.md, Restore](TUTORIAL.md#restore) |
 | `-SkipSqlSetup` | Don't touch SQL Server (the client's DBA manages it): the DBA runs `sql-prepare.sql` instead, see *SQL Server preparation* |
 | `-Client acme` | Install or update the client `acme` on a machine that backs up several clients: own data folder, key, Google account, task and SQL login. Letters, digits, `-`, `_`, at most 32; not `user` or a Windows device name (`con`, `nul`, `com1`, ...). See *Several clients on one machine* |
 | `-ListClients` | Only list what is installed here (default install and every client: data folder, task, next run, Google account) and exit |
@@ -444,7 +444,7 @@ without it, a command works on the default install.
 & $bm check --skip-sql                     # restore-only machine: everything except SQL Server and the backup folder
 & $bm backup                               # back up now (what the scheduled task runs)
 & $bm list [--db Sales] [--server NAME] [--json]   # backups on Google Drive
-& $bm download latest --db Sales [--server NAME] --out D:\restore   # see RESTORE.md
+& $bm download latest --db Sales [--server NAME] --out D:\restore   # see TUTORIAL.md, Restore
 & $bm auth status                          # which Google account is connected
 & $bm --help                               # all commands and options
 ```

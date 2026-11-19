@@ -18,7 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import AdmZip from 'adm-zip';
 
 const ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const APP_FILES = ['bin', 'src', 'package.json', 'package-lock.json', 'README.md', 'RESTORE.md'];
+const APP_FILES = ['bin', 'src', 'package.json', 'package-lock.json', 'README.md', 'TUTORIAL.md'];
 /** Copied from packaging/ into the zip root (CRLF). */
 export const PACKAGING_FILES = ['backup-manager.cmd', 'backup-manager.env.template', 'install.ps1', 'uninstall.ps1', 'sql-prepare.sql'];
 
