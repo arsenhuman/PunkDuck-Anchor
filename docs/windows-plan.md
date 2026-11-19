@@ -1,7 +1,7 @@
 # Windows packaging plan (phase B)
 
 Status: **implemented** on branch `feat/windows-packaging`. This file records the decisions behind the Windows-only
-product. The user-facing documentation is in the README and [RESTORE.md](../RESTORE.md); where they differ from this
+product. The user-facing documentation is in the README and [TUTORIAL.md](../TUTORIAL.md); where they differ from this
 plan, see *Implementation notes*.
 
 Builds on branch `chore/node22-deps`: Node 22 LTS, `mssql@12`, `google-auth-library@11`, `node-cron@4`, 83 tests.

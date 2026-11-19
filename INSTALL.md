@@ -233,7 +233,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -ZipPath .\backup-manager
 **Update to a new version:** run the same command from section 4 again. Settings, the key and the Google sign-in
 are kept.
 
-**Restoring a backup:** see [RESTORE.md](RESTORE.md).
+**Restoring a backup:** see [TUTORIAL.md, Restore](TUTORIAL.md#restore).
 
 **Uninstall:**
 

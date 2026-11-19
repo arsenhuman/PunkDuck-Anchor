@@ -31,7 +31,6 @@ keeps the key, not us.**
 
 **3. From the client**
 - Their **Gmail** address, and either the password or the client next to you to sign in.
-- **Does this server run 24/7, or is it turned off at night?** This decides the backup time (Step 3).
 - OK for a **~30-second SQL Server restart** (may be needed once, during install).
 - A **flash drive** or another place outside this server (their PC, their password manager) to keep the
   encryption key.
@@ -83,7 +82,8 @@ SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Bac
   and writes it here. The daily task uses this login. Fill in only if the client's IT gave you a login.
 - `BACKUP_ENCRYPTION_KEY`: generated in the next step.
 
-**`BACKUP_TIME`: when the daily backup starts** (24 h format). Depends on your answer from *Before you start*:
+**`BACKUP_TIME`: when the daily backup starts** (24 h format). **Ask the client: does this server run 24/7, or is
+it turned off at night?**
 - server runs **24/7** → leave `BACKUP_TIME=02:00` (nobody works at night);
 - server is **turned off at night** → `BACKUP_TIME=13:30` (lunch time, the server is on and quieter).
 
@@ -169,4 +169,115 @@ $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
 
 Backup failed: `& $bm check`, read the log in `C:\ProgramData\backup-manager\logs\`, fix, `& $bm backup`.
 
-Restore: [RESTORE.md](RESTORE.md). Several clients on one server and other special cases: [INSTALL.md](INSTALL.md).
+Several clients on one server and other special cases: [INSTALL.md](INSTALL.md).
+
+## Restore
+
+Restores are done **by us**, never by the client. There is no restore command: you download the backup (the program
+decrypts and decompresses it into a normal `.bak`), then restore it in SSMS.
+
+**Before you start**
+- RDP to the client's server, PowerShell as Administrator.
+- **The encryption key.** On the client's server it's already in the settings file. If you restore on another
+  machine, get it **from the client** (their flash drive). No key = no restore.
+- **Free disk space** for the full database size (the `.bak` is not compressed).
+- **Agree with the client** what to restore. Default: restore next to the live database under a new name
+  (`EXAMPLE_restored`) and let them check it. Overwrite the live database only if they explicitly ask.
+
+**1. Find the backup**
+
+```powershell
+$bm = "C:\Program Files\backup-manager\backup-manager.cmd"
+& $bm auth status            # must show the client's Gmail
+& $bm list --db EXAMPLE      # newest first: date, server/db, file name, size, id
+```
+
+**2. Download and decrypt**
+
+```powershell
+New-Item -ItemType Directory -Force D:\restore | Out-Null
+& $bm download latest --db EXAMPLE --out D:\restore     # newest backup
+& $bm download <id> --out D:\restore                     # or a specific one, id from "list"
+```
+
+You get `D:\restore\EXAMPLE_YYYYMMDDTHHMMSSZ.bak` (time in UTC). SQL Server must be able to read it: put it in the
+SQL backup folder (`SQL_BACKUP_DIR`) or give the SQL Server service account read access to `D:\restore`.
+
+**3. Check the file** (SSMS, new query)
+
+```sql
+RESTORE VERIFYONLY FROM DISK = N'D:\restore\EXAMPLE_20261116T010000Z.bak' WITH CHECKSUM;
+RESTORE FILELISTONLY FROM DISK = N'D:\restore\EXAMPLE_20261116T010000Z.bak';  -- logical names for MOVE below
+```
+
+**4a. Restore under a new name** (default)
+
+```sql
+RESTORE DATABASE EXAMPLE_restored
+FROM DISK = N'D:\restore\EXAMPLE_20261116T010000Z.bak'
+WITH MOVE N'EXAMPLE'     TO N'C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\DATA\EXAMPLE_restored.mdf',
+     MOVE N'EXAMPLE_log' TO N'C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\DATA\EXAMPLE_restored_log.ldf',
+     CHECKSUM, STATS = 10;
+```
+
+Use the logical names from `FILELISTONLY` after `MOVE N'...'`.
+
+**4b. Overwrite the live database** (only if the client asks)
+
+1. Nobody works in the application; stop its services if needed.
+2. Safety backup of the current state first: `& $bm backup --db EXAMPLE`.
+3. Then:
+
+```sql
+ALTER DATABASE EXAMPLE SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+RESTORE DATABASE EXAMPLE
+FROM DISK = N'D:\restore\EXAMPLE_20261116T010000Z.bak'
+WITH REPLACE, CHECKSUM, STATS = 10;
+ALTER DATABASE EXAMPLE SET MULTI_USER;
+```
+
+Everything written after that backup is gone.
+
+**5. After the restore**
+- Let the client check the data.
+- Delete the `.bak` from `D:\restore` (it's **not encrypted**). Drop `EXAMPLE_restored` when the client is done.
+- On another server, fix the orphaned user: `ALTER USER backup_user WITH LOGIN = backup_user;`
+
+### Client's server is dead: restore on another machine
+
+> **Careful:** a normal install here would back up *this* machine into the client's Drive and delete their old
+> backups by retention. Always use `-RestoreOnly`.
+
+1. On a Windows machine with SQL Server of the **same or newer version**, PowerShell as Administrator:
+
+   ```powershell
+   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+   irm https://github.com/arsenhuman/PunkDuck-Anchor/releases/latest/download/install.ps1 -OutFile install.ps1
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -RestoreOnly
+   ```
+
+   No daily task, no backup, SQL Server is not touched.
+2. In the .env: `BACKUP_ENCRYPTION_KEY` = the key **from the client's flash drive**, `GOOGLE_EMAIL` = client's Gmail.
+   Leave `SERVER_NAME` **empty** and the `SQL_*` lines as they are.
+3. Sign in to Google with the client's Gmail. The installer must say **"Restore-only install"**.
+4. `& $bm list` shows the old server's name in the `server/db` column. Use it in steps 1-2 with `--server`:
+
+   ```powershell
+   & $bm list --server CLIENT-PC --db EXAMPLE
+   & $bm download latest --server CLIENT-PC --db EXAMPLE --out D:\restore
+   ```
+
+   Then steps 3-5 as above.
+5. When done: `powershell -ExecutionPolicy Bypass -File "C:\Program Files\backup-manager\uninstall.ps1" -Purge`
+   (removes the key and Google sign-in from this machine; backups on Drive stay).
+
+### Restore errors
+
+| Message | What to do |
+|---------|------------|
+| `not logged in to Google` / `invalid_grant` | `& $bm auth login` |
+| `no backups found for database "X"` | Wrong name (case-sensitive), wrong Google account, or wrong `--server`. Run `& $bm list` without filters. |
+| `downloaded file checksum mismatch` | Download damaged. Run it again. |
+| `decryption failed: wrong key or corrupted file` | Wrong `BACKUP_ENCRYPTION_KEY`. Get the right one from the client. |
+| `... already exists (use --force to overwrite)` | That `.bak` is already in the folder. Delete it or add `--force`. |
+| SQL error 3241 / "media family is incorrectly formed" | The `.bak` is from a newer SQL Server than the one you restore to. |

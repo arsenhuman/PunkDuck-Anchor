@@ -16,7 +16,7 @@
     when its SHA-256 still matches, so running the installer again does not download the same version twice.
 
 .PARAMETER RestoreOnly
-    Restore machine for another client's backups (see RESTORE.md): skip SQL Server preparation, the SQL checks,
+    Restore machine for another client's backups (see TUTORIAL.md, Restore): skip SQL Server preparation, the SQL checks,
     the scheduled task and the first backup, so nothing is ever uploaded from this machine.
 
 .PARAMETER SkipSqlSetup
@@ -1494,7 +1494,7 @@ function Install-BackupManager {
 
     if ($RestoreOnly) {
         Write-Host ''
-        Write-Host 'Restore-only install: no scheduled task, no backup. See RESTORE.md.' -ForegroundColor Green
+        Write-Host 'Restore-only install: no scheduled task, no backup. See TUTORIAL.md, Restore.' -ForegroundColor Green
         Write-InstallSummary -NoTask
         return
     }
