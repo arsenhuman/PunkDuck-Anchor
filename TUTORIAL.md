@@ -2,7 +2,8 @@
 
 ## How it works
 
-Backup Manager is a small program installed on the client's server. Every night Windows Task Scheduler starts it.
+Backup Manager is a small program installed on the client's server. Every day at a set time (`BACKUP_TIME`) Windows Task Scheduler
+starts it.
 It:
 
 1. tells SQL Server to make a full backup (`.bak`) of each database, into SQL Server's backup folder;
@@ -30,6 +31,7 @@ keeps the key, not us.**
 
 **3. From the client**
 - Their **Gmail** address, and either the password or the client next to you to sign in.
+- **Does this server run 24/7, or is it turned off at night?** This decides the backup time (Step 3).
 - OK for a **~30-second SQL Server restart** (may be needed once, during install).
 - A **flash drive** or another place outside this server (their PC, their password manager) to keep the
   encryption key.
@@ -78,11 +80,14 @@ SQL_BACKUP_DIR=C:\Program Files\Microsoft SQL Server\MSSQL16.MERSOFT11\MSSQL\Bac
 
 **Leave empty:**
 - `SQL_USER` / `SQL_PASSWORD`: the installer creates SQL login `backup_user` (backup rights only, random password)
-  and writes it here. The nightly task uses this login. Fill in only if the client's IT gave you a login.
+  and writes it here. The daily task uses this login. Fill in only if the client's IT gave you a login.
 - `BACKUP_ENCRYPTION_KEY`: generated in the next step.
-- `HEALTHCHECK_URL`: we don't use it.
 
-**Leave as is:** `BACKUP_TIME=02:00` (nightly start), `KEEP_LAST=7`, `KEEP_DAYS=30` (retention on Drive),
+**`BACKUP_TIME`: when the daily backup starts** (24 h format). Depends on your answer from *Before you start*:
+- server runs **24/7** → leave `BACKUP_TIME=02:00` (nobody works at night);
+- server is **turned off at night** → `BACKUP_TIME=13:30` (lunch time, the server is on and quieter).
+
+**Leave as is:** `KEEP_LAST=7`, `KEEP_DAYS=30` (retention on Drive),
 `SQL_HOST=localhost`, `SQL_PORT=1433`, `SQL_LOCAL_BACKUP_DIR` and `SERVER_NAME` (empty = computer name as Drive
 folder).
 
@@ -126,18 +131,15 @@ A browser opens with the Google sign-in:
 2. "Google hasn't verified this app" → **Continue**. Permissions → **Allow** / **Continue**.
 3. Browser says sign-in complete → back to PowerShell, it continues by itself.
 
-**Browser didn't open, or Windows Server blocks Google** (common):
-
-1. PowerShell prints a long link. Select it with the mouse and press **Enter** to copy.
-2. Open it on **your own laptop**, sign in with the client's account, allow.
-3. The page then shows **"This site can't be reached"**. That's expected.
-4. Copy the **whole address** from the address bar, paste it into PowerShell (**Ctrl+V**), press **Enter**.
+**Browser didn't open?** PowerShell prints a long link. Select it with the mouse, press **Enter** to copy, paste it
+into a browser on the server by hand, sign in with the client's Gmail and allow access to Google Drive. PowerShell
+continues by itself.
 
 Then the installer checks it's the right account.
 
 ## Step 7: Task and first backup
 
-**10/11**: creates the nightly task **"PunkDuck Backup Manager"** in Task Scheduler (runs as SYSTEM at `BACKUP_TIME`).
+**10/11**: creates the daily task **"PunkDuck Backup Manager"** in Task Scheduler (runs as SYSTEM at `BACKUP_TIME`).
 
 **11/11**: runs the first backup. Up to an hour on big databases. Don't close the window.
 
@@ -155,7 +157,7 @@ always safe: it keeps what's done.
 
 ## Backups by hand
 
-Nightly backups are automatic. To back up now (e.g. before a software update), PowerShell as Administrator:
+Daily backups are automatic. To back up now (e.g. before a software update), PowerShell as Administrator:
 
 ```powershell
 $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
@@ -165,6 +167,6 @@ $bm = "C:\Program Files\backup-manager\backup-manager.cmd"
 & $bm check                # checks settings, SQL, Google; all lines should say OK
 ```
 
-Failed night: `& $bm check`, read the log in `C:\ProgramData\backup-manager\logs\`, fix, `& $bm backup`.
+Backup failed: `& $bm check`, read the log in `C:\ProgramData\backup-manager\logs\`, fix, `& $bm backup`.
 
 Restore: [RESTORE.md](RESTORE.md). Several clients on one server and other special cases: [INSTALL.md](INSTALL.md).
